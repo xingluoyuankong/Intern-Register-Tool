@@ -41,6 +41,32 @@ WORKER_BASE = os.getenv("IR_WORKER_BASE", "")
 WORKER_ADMIN_TOKEN = os.getenv("IR_WORKER_ADMIN_TOKEN", "")
 WORKER_DOMAIN = os.getenv("IR_WORKER_DOMAIN", "")
 
+# ── 邮箱后端选择 ──────────────────────────────────────────────────
+# `worker`  = 上面的自建 CF Worker 邮箱（三项必填）
+# `temptf`  = 公共 temp.tf 临时邮箱（免注册，见 src/temptf.py）
+#
+# 🔴 为什么做成开关而不是替换：两条链路的**收信接口形状完全不同**
+#    （Worker 侧给提取好的 `extracted_json`，temp.tf 只给原始 HTML），
+#    硬改成"二选一"会让已跑通的 Worker 路径承担回归风险。
+MAIL_PROVIDER = os.getenv("IR_MAIL_PROVIDER", "worker").strip().lower()
+
+TEMPTF_BASE = os.getenv("IR_TEMPTF_BASE", "https://temp.tf").strip()
+# 建箱时按这个顺序降级（实测池子：outlook 25 / hotmail 26 / gmail 5 个账号）
+TEMPTF_PROVIDERS = [
+    p.strip()
+    for p in os.getenv("IR_TEMPTF_PROVIDERS", "outlook,hotmail,gmail").split(",")
+    if p.strip()
+] or ["outlook", "hotmail", "gmail"]
+
+# 邮箱侧是否走代理（与 tempmail.py 里那个 `IR_PROXY_MAIL` 同义，提到 config 层
+# 是为了让两个后端共用同一条判断，别各写一份）
+MAIL_PROXY = os.getenv("IR_PROXY_MAIL", "").strip().lower() in ("1", "true", "yes")
+
+# ── 阿里云 WAF 挑战（acw_sc__v2）─────────────────────────────────
+# `register/byEmail` 等写接口会返回 JS 挑战页（2026-09-30 实测），由
+# `src/waf_bypass.py` 用真实浏览器算 cookie 后重放。这里是求解超时。
+WAF_SOLVE_TIMEOUT = int(os.getenv("IR_WAF_SOLVE_TIMEOUT", "90"))
+
 # ── OpenXLab SSO ─────────────────────────────────────────────────
 SSO_BASE = "https://sso.openxlab.org.cn"
 SSO_GW = f"{SSO_BASE}/gw/uaa-be/api/v1"
@@ -388,14 +414,21 @@ def validate(*, need_worker_token: bool = True) -> list[str]:
     由入口显式调用，报错时直接给出修法。
     """
     missing = []
-    if need_worker_token and not WORKER_ADMIN_TOKEN:
-        missing.append("IR_WORKER_ADMIN_TOKEN")
-    # 这两项不再有写死的默认值（本仓库是公开的），缺失时在入口报错，
-    # 而不是带着空 base 去发一堆注定失败的请求。
-    if not WORKER_BASE:
-        missing.append("IR_WORKER_BASE")
-    if not WORKER_DOMAIN:
-        missing.append("IR_WORKER_DOMAIN")
+    if MAIL_PROVIDER == "temptf":
+        # temp.tf 免注册、免 token —— 只校验后端名本身，三项 Worker 凭据不需要。
+        pass
+    else:
+        if need_worker_token and not WORKER_ADMIN_TOKEN:
+            missing.append("IR_WORKER_ADMIN_TOKEN")
+        # 这两项不再有写死的默认值（本仓库是公开的），缺失时在入口报错，
+        # 而不是带着空 base 去发一堆注定失败的请求。
+        if not WORKER_BASE:
+            missing.append("IR_WORKER_BASE")
+        if not WORKER_DOMAIN:
+            missing.append("IR_WORKER_DOMAIN")
+        # 提示有退路：没 Worker 也能跑（很多人卡在这一步就以为项目跑不起来）
+        if missing and not TEMPTF_BASE:
+            missing.append("（或设 IR_MAIL_PROVIDER=temptf 走公共临时邮箱）")
 
     # 配了槽位池却没给「端口 -> 出口 IP」映射：`slot_scope()` 会在**第一个任务**
     # 才抛错，那时已经跑了一半。提前到启动阶段报，并指路到探测器。

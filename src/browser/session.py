@@ -5,6 +5,7 @@
 - `_retry_loop()` 消掉了 `login()` 与 `BrowserSession.login()` 约 20 行重复。
 """
 
+import os
 import random
 import time
 
@@ -30,12 +31,37 @@ def _launch_kwargs(headless: bool, chrome_args=None) -> dict:
 
     改成参数后，注入面不再依赖模块内部布局。`None` → 用模块级 `CHROME_ARGS`，
     所以旧调用方零改动。
+
+    🔴 2026-09-30：**无头模式改用 playwright 自带 chromium**（headless shell）。
+       实测本机的系统 Chrome（用户级安装）被 playwright 1.63 驱动时，
+       `browser.close()` 会把 driver 连接弄断、进程挂死 5 分钟 ——
+       整个批量跑批因此卡住（run.py 日志停在 "browser ready" 后无输出）。
+       headless shell 无此问题。有头模式（--headful）仍用 `CHROME_PATH`。
+
+    🔴 2026-09-30：**浏览器默认跟随环境代理**。实测本机 requests 走
+       `http_proxy=127.0.0.1:31777` 一切正常，而 Chrome 直连
+       `sso.openxlab.org.cn/login` 直接 `ERR_CONNECTION_CLOSED` ——
+       登录阶段因此全灭（注册是 requests 走的，所以不受影响）。
+       Chromium 的 `proxy` launch 参数让它跟 requests 同路径。
+       `IR_BROWSER_PROXY=0` 可关（要直连调试时用）。
     """
-    return dict(
-        executable_path=config.CHROME_PATH,
+    if headless:
+        from ..waf_bypass import find_headless_browser
+        exe = find_headless_browser()
+    else:
+        exe = config.CHROME_PATH
+    kw = dict(
+        executable_path=exe,
         headless=headless,
         args=CHROME_ARGS if chrome_args is None else list(chrome_args),
     )
+    if os.getenv("IR_BROWSER_PROXY", "1").strip().lower() not in ("0", "false", "no"):
+        proxy = (os.getenv("IR_BROWSER_PROXY", "").strip()
+                 or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+                 or os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY"))
+        if proxy:
+            kw["proxy"] = {"server": proxy}
+    return kw
 
 
 def _retry_loop(run_once, *, attempts: int, cooldown: float, verbose: bool,
@@ -114,12 +140,14 @@ class BrowserSession:
         return self
 
     def __exit__(self, *exc):
-        try:
-            if self._browser:
-                self._browser.close()
-        finally:
-            if self._pw:
-                self._pw.stop()
+        """🔴 不调 `browser.close()` / `pw.stop()` —— 本机实测二者都会**挂死**
+        （不是抛异常，是永远不返回，2026-09-30 探针确认）。改为直接杀
+        driver 进程树：node driver 是 python 子进程、chrome 是 node 子进程，
+        杀树 = 全部收干净。见 `waf_bypass.kill_driver_tree`。"""
+        pw, self._pw, self._browser = self._pw, None, None
+        if pw is not None:
+            from ..waf_bypass import kill_driver_tree
+            kill_driver_tree(pw)
         return False
 
     def login(self, account: str, password: str, *, timeout: int = 150,

@@ -225,3 +225,18 @@ class TempMailClient:
         if not mail:
             return None
         return mail.find_link("active", "activat", "verif", "confirm")
+
+
+def build_mail_client(*, base: str = None, token: str = None, timeout: int = None):
+    """按 `config.MAIL_PROVIDER` 造邮箱客户端。
+
+    🔴 上游（`pipeline` / 探针）**统一走这个工厂**，别直接 `TempMailClient()` ——
+    否则换后端时每个调用点都要改一遍，漏一个就是"配了开关但不生效"。
+    两个后端实现同一组方法（`create_mailbox` / `wait_for_mail` /
+    `wait_for_activation_link` / `list_mails`）+ 同一组诊断字段
+    （`last_error` / `last_polls` / `last_http_errors`），所以上游无需分支。
+    """
+    if config.MAIL_PROVIDER == "temptf":
+        from .temptf import TempTfClient
+        return TempTfClient(base=base, timeout=timeout)
+    return TempMailClient(base=base, token=token, timeout=timeout)

@@ -39,19 +39,20 @@ def login(account: str, password: str, *, headless: bool = True,
     """
     from playwright.sync_api import sync_playwright
 
+    from ..waf_bypass import kill_driver_tree
+
     def run_once(tag):
-        with sync_playwright() as p:
+        # 🔴 不用 `with sync_playwright()`：它的 __exit__ 会调 stop()，
+        #    本机实测挂死。改 start() + finally 杀 driver 进程树。
+        p = sync_playwright().start()
+        try:
             browser = p.chromium.launch(**_launch_kwargs(headless, chrome_args))
-            try:
-                return _run_attempt(browser, account=account, password=password,
-                                    headless=headless, timeout=timeout,
-                                    screenshot_prefix=screenshot_prefix,
-                                    verbose=verbose, tag=tag)
-            finally:
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+            return _run_attempt(browser, account=account, password=password,
+                                headless=headless, timeout=timeout,
+                                screenshot_prefix=screenshot_prefix,
+                                verbose=verbose, tag=tag)
+        finally:
+            kill_driver_tree(p)
 
     return _retry_loop(run_once, attempts=attempts, cooldown=cooldown,
                        verbose=verbose, retry_hint="换新会话重试")

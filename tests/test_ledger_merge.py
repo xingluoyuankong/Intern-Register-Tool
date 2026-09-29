@@ -125,8 +125,15 @@ def test_t7_save_guard_against_silent_shrinkage(any_ledger, tmp_path):
     # 前置条件：`any_ledger[:10]` 必须**真的比基线少**，否则"缩水"根本没发生，
     # 断言 `pytest.raises(ValueError)` 会以 DID NOT RAISE 的形态炸掉，
     # 而真实原因（基线太短）在报错里看不出来。2026-09-19 CI 上就是这么红的。
-    assert len(any_ledger) > 10, \
-        f"基线只有 {len(any_ledger)} 条，[:10] 截不出缩水，T7 无从验证"
+    #
+    # 2026-09-30：assert 改 skip。真实台账是**随使用累积**的（新机器 / 刚起步
+    # 时只有个位数条），拿 assert 硬拦会把"环境数据不足"误报成"护栏坏了"。
+    # 样本台账恒为 47 条，CI 覆盖不受影响 —— real_ledger 这一路照 conftest
+    # 的约定**大声跳过**，绝不静默假绿。
+    if len(any_ledger) <= 10:
+        pytest.skip(
+            f"基线只有 {len(any_ledger)} 条，[:10] 截不出缩水，T7 无从验证"
+            "（真实台账刚起步时会这样；样本台账恒为 47 条，CI 不受影响）")
 
     p = tmp_path / "results.json"
     p.write_text(json.dumps(any_ledger, ensure_ascii=False), encoding="utf-8")

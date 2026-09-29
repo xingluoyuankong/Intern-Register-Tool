@@ -68,6 +68,30 @@ class SSOClient:
         h["Referer"] = f"{config.SSO_BASE}{referer_path}"
         return h
 
+    @staticmethod
+    def _is_waf_challenge(r: requests.Response) -> bool:
+        """阿里云 WAF 的 JS 挑战页（2026-09-30 实测开始拦截写接口）。
+
+        特征：HTTP **200**（不是 403！）+ `text/html` + 页内含
+        `acw_sc__v2` / `aliyunwaf`。与正常 JSON 响应（application/json）一眼可分。
+        """
+        ct = (r.headers.get("content-type") or "").lower()
+        return ("text/html" in ct
+                and ("acw_sc__v2" in r.text or "aliyunwaf" in r.text))
+
+    def _solve_waf(self, r: requests.Response) -> None:
+        """解挑战页 → 把 cookie 塞进本 session → 由调用方重放原请求。
+
+        🔴 `acw_tc` 不用手动塞：首发响应的 `set-cookie` 已被 requests 自动
+           收进 `self.session.cookies`（探针实测漏带它会被服务端**挂起**）。
+           这里只补浏览器算出的 `acw_sc__v2`。
+        """
+        from .waf_bypass import WafSolver
+
+        cookies = WafSolver.get().solve(r.text)
+        for k, v in cookies.items():
+            self.session.cookies.set(k, v, domain="sso.openxlab.org.cn", path="/")
+
     def _post(self, path: str, payload: dict, *, referer: str = "/register",
               attempts: int = 4) -> requests.Response:
         """带退避重试的 POST。
@@ -79,12 +103,23 @@ class SSOClient:
         ⚠ 2026-09-20 删掉了原先的 `auth: str = None` 形参（连同一个
         `if auth: h["Authorization"] = …` 分支）：它唯一的调用者是已删除的
         `internal_auth()`，删后全仓无调用者传 `auth=`（已 grep 确认）。
+
+        2026-09-30 新增：响应是 WAF 挑战页时，解出 `acw_sc__v2` 塞回 session
+        再重放（见 `_solve_waf`）。挑战重放**同样占用 attempts** —— 挑战最多
+        应该出现 1 次，连续出现说明 cookie 不被认（IP 换了 / 有效期极短），
+        此时多试也无益，如实返回最后一枪让上层归因。
         """
         h = self._headers(referer)
         url = f"{self.gw}{path}"
         last = None
         for i in range(attempts):
             r = self.session.post(url, headers=h, json=payload, timeout=self.timeout)
+            if self._is_waf_challenge(r):
+                last = r
+                if i == attempts - 1:
+                    break
+                self._solve_waf(r)
+                continue
             if r.status_code == 429 or r.status_code >= 500:
                 last = r
                 if i == attempts - 1:
