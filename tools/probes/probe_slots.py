@@ -188,6 +188,15 @@ def main() -> int:
         tag = f"  ⚠ {len(ss)} 个槽位共用同一个出口" if len(ss) > 1 else ""
         print(f"  {ip:<18} {len(ss)} 个槽位: {', '.join(ss)}{tag}")
 
+    # 可直接粘贴的 `IR_SLOT_EGRESS_IPS` 建议（键规则与 config.slot_scope
+    # 一致：带账密的槽位取用户名 —— 同端点多会话模型；裸 host:port 取端口）
+    pairs = [f"{config.slot_key(r['slot'])}={r['egress_ip']}"
+             for r in results if r["egress_ip"] and config.slot_key(r["slot"])]
+    if pairs:
+        print("\nIR_SLOT_EGRESS_IPS=（粘进 .env，键=用户名或端口）")
+        for i in range(0, len(pairs), 3):
+            print("  " + ",".join(pairs[i:i + 3]))
+
     if not args.fast:
         ok = [r for r in results if r["verdict"] == "可用"]
         blocked = [r for r in results if r["verdict"] == "被代理拦截"]

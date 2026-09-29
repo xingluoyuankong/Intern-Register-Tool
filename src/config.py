@@ -9,6 +9,8 @@
 import os
 from pathlib import Path
 
+from . import redact
+
 
 def _load_dotenv(path: Path) -> None:
     """极简 `.env` 解析（stdlib 实现，不引 python-dotenv 依赖）。
@@ -326,22 +328,47 @@ def slot_scope(url: str) -> str:
     出口 IP 才是目标站点真正封的那个东西，也是唯一不随配置漂移的标识。
     用位置号（`slot1`/`slot2`）当 scope 是错的 —— 见 `SLOT_EGRESS_IPS` 的说明。
 
-    🔴 端口不在映射表里时**大声报错，不退回位置号**：
+    🔴 映射键有两种模型（2026-09-30 起）：
+
+      - **mihomo 本地多端口**：`127.0.0.1:7901`（无账密）→ 键 = **端口**。
+        一个端口一个出口，`IR_SLOT_EGRESS_IPS=7901=1.2.3.4,...`。
+      - **同端点多会话**（Resin 这类代理网关）：`http://user:@host:2268`，
+        10 条槽位**共用同一个端口**、靠用户名区分出口 → 键 = **用户名**。
+        `IR_SLOT_EGRESS_IPS=Link.rl2.abc=1.2.3.4,Link.rl2.def=5.6.7.8,...`。
+        按端口做键的话 10 条会全部映射到同一个 IP —— 配额全记进一个桶、
+        同出口互斥把并发压成 1，整个槽位池等于白配（实测踩过）。
+
+    🔴 键不在映射表里时**大声报错，不退回位置号**：
     静默错配会让某个 IP 悄悄超过上限（真被目标站封），
     比"跑不起来、逼你去补映射"危险得多。
     """
-    port = url.rsplit(":", 1)[-1].strip()
-    ip = SLOT_EGRESS_IPS.get(port)
+    key = slot_key(url)
+    ip = SLOT_EGRESS_IPS.get(key)
     if not ip:
         raise ValueError(
-            f"槽位 {url} 的出口 IP 未知（端口 {port} 不在 SLOT_EGRESS_IPS 里）。\n"
+            f"槽位 {redact.redact_url(url) if url else url} 的出口 IP 未知"
+            f"（键 {key!r} 不在 SLOT_EGRESS_IPS 里）。\n"
             f"  1) 先量出真实出口 IP： python tools/probes/probe_slots.py\n"
             f"  2) 写进 .env（**不要写进源码**，出口 IP 不进仓库）：\n"
-            f"       IR_SLOT_EGRESS_IPS={port}=<那个槽位的出口 IP>\n"
-            f"     多个槽位用逗号分隔：7901=1.1.1.1,7902=2.2.2.2\n"
+            f"       IR_SLOT_EGRESS_IPS={key}=<那个槽位的出口 IP>\n"
+            f"     多个槽位用逗号分隔；键 = URL 里的用户名（带账密时）"
+            f"或端口（裸 host:port 时）\n"
             f"  3) 迁移台账： python tools/data/migrate_quota_scope.py --apply\n"
             f"  —— 不能退回按槽位号记账：那会静默把配额记到别的 IP 头上。")
     return ip
+
+
+def slot_key(url: str) -> str:
+    """槽位 → 映射表键：带 `@` 取**用户名**（同端点多会话模型），
+    否则取端口（mihomo 本地多端口模型）。解析不出返回空串（调用方报错）。"""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    if "@" in raw:
+        cred = raw.split("://", 1)[-1].rsplit("@", 1)[0]
+        return cred.split(":", 1)[0]
+    hostport = raw.split("://", 1)[-1].split("/", 1)[0]
+    return hostport.rpartition(":")[2]
 
 
 def proxies(raw: str = None) -> dict | None:
