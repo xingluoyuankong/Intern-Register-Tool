@@ -77,21 +77,131 @@ python tools/gates/selftest_check_leaks.py   # 验证闸门**真的会拦**（�
 本机 Chrome 路径默认 `C:\Program Files\Google\Chrome\Application\chrome.exe`，
 可通过环境变量 `IR_CHROME_PATH` 覆盖。
 
+### 部署注意事项（2026-09-30 全新环境实测踩坑实录）
+
+以下每一条都在一台干净的 Windows + Python 3.13 机器上**实际撞过**，不是理论清单。
+按顺序读，撞到对应报错直接跳到对应条目。
+
+#### 1. 依赖安装：pip 镜像源可能整体不可用
+
+症状：`pip install -r requirements.txt` 报
+`Could not find a version that satisfies the requirement requests>=2.31 (from versions: none)`。
+不是包不存在，是配置的镜像源（`pip.ini` 里的 `index-url`）当前不可达 ——
+先 `curl -s -o /dev/null -w "%{http_code}" <index-url>/requests/` 探一下，
+不通就临时指定官方源（别急着改全局配置）：
+
+```bash
+.venv/Scripts/python -m pip install -r requirements.txt -i https://pypi.org/simple
+```
+
+CI 装的是精确列表（`pytest requests cryptography`），不受此影响。
+
+#### 2. 邮箱后端二选一：CF Worker（三项凭据）或 temp.tf（零凭据）
+
+缺 `IR_WORKER_ADMIN_TOKEN` / `IR_WORKER_BASE` / `IR_WORKER_DOMAIN` 时启动即报错退出。
+**没有自建 Worker 也能跑**：`.env` 里加一行
+
+```
+IR_MAIL_PROVIDER=temptf
+```
+
+即切到公共临时邮箱后端 `src/temptf.py`（真实 outlook / hotmail / gmail 别名池，
+建箱 API `GET /api/account?providers=outlook&dot=0&plus=1`，收信 `POST /api/check`）。
+实测注册 → 收激活邮件 → 提取链接全链路可用。两个后端实现同一组方法，
+上游 `pipeline` 通过 `build_mail_client()` 工厂无感知切换，行为差异只在：
+
+- Worker 侧服务端预提取激活链接（`extracted_json`）；temp.tf 侧由客户端从 HTML
+  正文正则抽取（`&amp;` 等实体先还原，href 优先、裸 URL 兜底）再回填同一形状；
+- temp.tf 建箱撞 429 时按 provider 顺序降级（outlook → hotmail → gmail），
+  不是失败 —— 这是限流信号；
+- temp.tf 的发件人字段可能是代发地址，`wait_for_mail` 对 `sender_contains`
+  是**软过滤**（先按关键词找，找不到退回该地址第一封），别把它改成硬过滤。
+
+域名偏好顺序用 `IR_TEMPTF_PROVIDERS=outlook,hotmail,gmail` 控制（默认即此序）。
+
+#### 3. WAF：SSO 写接口返回 HTML 而不是 JSON（`Expecting value: line 1 column 1`）
+
+症状：`register/byEmail` 返回 HTTP **200** + `text/html`，内容是阿里云 WAF 的
+JS 挑战页（内含 `arg1` 与混淆 JS、`acw_sc__v2` 字样）。注意**不是 403**，
+`raise_for_status()` 拦不住它。
+
+`src/waf_bypass.py` 已内置自动破解：用 playwright 自带 chromium 在**同源假页面**
+（route 到 `sso.openxlab.org.cn/__waf_probe`）执行挑战页自带的算法，算出
+`acw_sc__v2` cookie 后由 `SSOClient._post` 自动重放。三个实测要点（改动前必读）：
+
+1. **`acw_tc` 必须在**。它是首发响应的 `set-cookie`，requests 的 session 会自动收，
+   不用手动塞；只带 `acw_sc__v2` 不带它，重放请求会被服务端**挂起不响应**；
+2. **重放必须与首发走同一条网络路径**（同代理配置）。实测同一台机器上
+   首发走环境代理、重放改直连，POST 直接挂起 —— 路径一变 cookie 就作废；
+3. headless shell 每次算 cookie 约 1.5s，正常出现在 `register_call` 耗时里，
+   不要把它当异常优化掉。
+
+浏览器可执行文件自动发现顺序：`IR_WAF_BROWSER_PATH` → playwright 缓存里最新的
+`chromium_headless_shell-*` → 回退 `IR_CHROME_PATH`。求解超时 `IR_WAF_SOLVE_TIMEOUT`
+（默认 90s）。
+
+#### 4. 浏览器退出挂死：`browser.close()` / `pw.stop()` 可能永远不返回
+
+症状：批量跑批日志停在 `browser ready` 后无输出，进程存活但什么都不做，
+最终只能整棵杀掉。实测部分系统级 Chrome 安装（用户级目录）被 playwright
+驱动时，`close()` 会把 driver 连接弄断且**不抛异常、不返回**。
+
+处理（已固化在代码里）：无头模式一律改用 playwright 自带 headless shell；
+退出路径（`BrowserSession.__exit__` / `entry.login` 的 finally）不调
+`close()/stop()`，改 `kill_driver_tree()` 直接杀 node driver 进程树
+（Windows `taskkill /F /T /PID`）。**自己写探针时同理：拿完数据直接强退，
+不要指望优雅关闭。**
+
+#### 5. 浏览器不走 requests 的代理：登录阶段 `ERR_CONNECTION_CLOSED`
+
+requests 会读 `http_proxy` / `https_proxy` 环境变量；Chromium 不会 ——
+它只认系统代理或 `launch(proxy=...)`。实测同机 requests 全通、浏览器直连
+SSO 登录页直接连接被重置，登录阶段全灭而注册正常，极具迷惑性。
+
+现在 `_launch_kwargs()` 默认把环境代理转成 `launch(proxy={"server": ...})`
+（优先 `IR_BROWSER_PROXY`，其次 `https_proxy` → `http_proxy` 环境变量）。
+要直连调试用 `IR_BROWSER_PROXY=0` 关掉。
+
+#### 6. 配额与封禁是 IP 维度的，本地计数只是护栏
+
+`register/byEmail` 两层限制：瞬时速率（代码里 `REG_MIN_INTERVAL` 闸门）
++ 累计配额（约 40 个/24h，之后 `B0000`）。撞顶后**换出口 IP 才有用**
+（`IR_PROXY` / 槽位池），换邮箱域名无效。本地计数
+（`.workbuddy-ai/state/register_quota.jsonl`）按出口分桶记录，
+删了它不会解封，只会让你重新撞一遍。
+
+#### 7. 常见报错速查
+
+| 报错 / 症状 | 原因 | 处置 |
+|---|---|---|
+| `Expecting value: line 1 column 1 (char 0)` | 响应是 WAF 挑战页 | 已自动处理；仍出现 → 看 `waf_bypass` 日志，确认浏览器可执行文件能启动 |
+| 登录阶段 `net::ERR_CONNECTION_CLOSED` | 浏览器没走代理 | 检查 `IR_BROWSER_PROXY` / 环境代理变量 |
+| run.py 卡在 `browser ready` 不动 | 浏览器退出挂死 | 已改 headless shell + 杀进程树；确认 `IR_CHROME_PATH` 指向的浏览器版本与 playwright 兼容 |
+| `register: B0000 请求频繁` | 累计配额触顶（IP 维度） | 等窗口恢复或换出口 IP；`--ignore-quota` 只用于确认服务端已恢复 |
+| `activation link not found in mail` | 邮件到了但链接没抽出来 | 看 `tempmail.Mail.links`；temp.tf 路径检查 `_extract_links` 的实体还原与关键词 |
+| 建箱 429 | temp.tf 限流 | 正常降级重试；批量时降低并发或换 provider 顺序 |
+
 ### 环境变量
 
 **凭据（必填）**
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `IR_WORKER_ADMIN_TOKEN` | **无 —— 必填** | CF Worker 的 Admin Token。缺失时启动阶段即报错退出 |
-| `IR_WORKER_BASE` | **无 —— 必填** | 临时邮箱 Worker 地址，形如 `https://<worker>.<subdomain>.workers.dev` |
-| `IR_WORKER_DOMAIN` | **无 —— 必填** | 建邮箱使用的域名（须在该 Worker 的域名列表里） |
+| `IR_MAIL_PROVIDER` | `worker` | 邮箱后端：`worker`（自建 CF Worker，下三项必填）/ `temptf`（公共临时邮箱，**零凭据**，见 `src/temptf.py`） |
+| `IR_WORKER_ADMIN_TOKEN` | worker 模式**必填** | CF Worker 的 Admin Token。缺失时启动阶段即报错退出 |
+| `IR_WORKER_BASE` | worker 模式**必填** | 临时邮箱 Worker 地址，形如 `https://<worker>.<subdomain>.workers.dev` |
+| `IR_WORKER_DOMAIN` | worker 模式**必填** | 建邮箱使用的域名（须在该 Worker 的域名列表里） |
 
 **可选（都有实测默认值，通常不用动）**
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `IR_CHROME_PATH` | 本机 Chrome | 浏览器可执行文件 |
+| `IR_CHROME_PATH` | 本机 Chrome | 浏览器可执行文件（有头模式用） |
+| `IR_TEMPTF_BASE` | `https://temp.tf` | temp.tf 后端地址（`IR_MAIL_PROVIDER=temptf` 时生效） |
+| `IR_TEMPTF_PROVIDERS` | `outlook,hotmail,gmail` | temp.tf 建箱的域名尝试顺序（撞 429 按序降级） |
+| `IR_WAF_BROWSER_PATH` | 自动发现 | WAF 挑战求解用的浏览器（默认取 playwright 缓存里最新的 headless shell） |
+| `IR_WAF_SOLVE_TIMEOUT` | `90` | WAF cookie 计算超时（秒） |
+| `IR_BROWSER_PROXY` | 跟随环境代理 | 浏览器代理（`launch(proxy=...)`）。显式给值覆盖环境变量，置 `0` 直连 |
 | `IR_CHAT_API_BASE` | `https://discovery-api.intern-ai.org.cn/v1` | 推理网关 |
 | `IR_MICRO_BUDGET` | `45` | 鼠标喂数据预算（秒）。**只能往大调**，往小调会稳定拿到更差的 Path B，见下 |
 | `IR_TYPE_DELAY_LO` / `_HI` | `45` / `110` | 逐字输入的按键间隔（毫秒）。**已实测调小净收益仅 0.5s**，见下 |
