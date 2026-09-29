@@ -40,10 +40,12 @@ def find_headless_browser() -> str:
 
     顺序：`IR_WAF_BROWSER_PATH` → playwright 缓存里**最新**的
     chromium_headless_shell → 回退 `config.CHROME_PATH`。
-    三平台缓存布局（playwright 官方安装位置）：
-      Windows  ~/AppData/Local/ms-playwright/chromium_headless_shell-*/<dir>/chrome-headless-shell.exe
-      Linux    ~/.cache/ms-playwright/chromium_headless_shell-*/chrome-linux*/headless_shell
-      macOS    ~/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-mac*/headless_shell
+    三平台缓存布局（playwright ≥1.49 实测，headless shell 独立成包后
+    各平台目录名统一为 chrome-headless-shell-<os><arch>，可执行文件两套名都有）：
+      Windows  ~/AppData/Local/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-win64/chrome-headless-shell.exe
+      Linux    ~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell
+               （旧布局 chrome-linux*/headless_shell 仍兼容）
+      macOS    ~/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-mac*/chrome-headless-shell
     """
     env = os.getenv("IR_WAF_BROWSER_PATH", "").strip()
     if env and os.path.isfile(env):
@@ -58,6 +60,12 @@ def find_headless_browser() -> str:
     for root in roots:
         cands += glob.glob(os.path.join(
             root, "chromium_headless_shell-*", "*", "chrome-headless-shell.exe"))
+        cands += glob.glob(os.path.join(
+            root, "chromium_headless_shell-*", "chrome-headless-shell-*",
+            "chrome-headless-shell"))
+        cands += glob.glob(os.path.join(
+            root, "chromium_headless_shell-*", "chrome-headless-shell-*",
+            "chrome-headless-shell.exe"))
         cands += glob.glob(os.path.join(
             root, "chromium_headless_shell-*", "chrome-linux*", "headless_shell"))
         cands += glob.glob(os.path.join(
