@@ -40,17 +40,31 @@ def find_headless_browser() -> str:
 
     顺序：`IR_WAF_BROWSER_PATH` → playwright 缓存里**最新**的
     chromium_headless_shell → 回退 `config.CHROME_PATH`。
+    三平台缓存布局（playwright 官方安装位置）：
+      Windows  ~/AppData/Local/ms-playwright/chromium_headless_shell-*/<dir>/chrome-headless-shell.exe
+      Linux    ~/.cache/ms-playwright/chromium_headless_shell-*/chrome-linux*/headless_shell
+      macOS    ~/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-mac*/headless_shell
     """
     env = os.getenv("IR_WAF_BROWSER_PATH", "").strip()
     if env and os.path.isfile(env):
         return env
-    cache = os.path.join(os.path.expanduser("~"), "AppData", "Local",
-                         "ms-playwright")
-    cands = sorted(glob.glob(os.path.join(
-        cache, "chromium_headless_shell-*", "*", "chrome-headless-shell.exe")))
+    home = os.path.expanduser("~")
+    roots = [
+        os.path.join(home, "AppData", "Local", "ms-playwright"),
+        os.path.join(home, ".cache", "ms-playwright"),
+        os.path.join(home, "Library", "Caches", "ms-playwright"),
+    ]
+    cands: list[str] = []
+    for root in roots:
+        cands += glob.glob(os.path.join(
+            root, "chromium_headless_shell-*", "*", "chrome-headless-shell.exe"))
+        cands += glob.glob(os.path.join(
+            root, "chromium_headless_shell-*", "chrome-linux*", "headless_shell"))
+        cands += glob.glob(os.path.join(
+            root, "chromium_headless_shell-*", "chrome-mac*", "headless_shell"))
     if cands:
         # 版本号排序取最新（目录名 chromium_headless_shell-<build>）
-        return cands[-1]
+        return sorted(cands)[-1]
     return config.CHROME_PATH
 
 
@@ -60,7 +74,9 @@ def kill_driver_tree(pw) -> None:
     为什么不用 `browser.close()`：本机实测它**挂死**（不是抛异常，是永远不
     返回）。playwright 没有官方的"浏览器进程 PID"接口，而 driver（node）是
     python 的子进程、chrome 是 node 的子进程，所以杀 driver 的进程树 =
-    全部收掉。Windows 上用 `taskkill /T /F`。
+    全部收掉。Windows 用 `taskkill /F /T`；POSIX 递归读
+    `/proc/<pid>/task/<tid>/children` 自顶向下 SIGKILL（不递归会漏掉
+    chrome 的多级子进程，它们被 init 收养后仍驻留）。
     """
     if pw is None:
         return
@@ -71,10 +87,33 @@ def kill_driver_tree(pw) -> None:
         pid = None
     if not pid:
         return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=15, check=False)
+        except Exception:
+            pass
+        return
+    # POSIX：/proc 遍历，先杀叶子再杀根，最后兜底整组
     try:
-        subprocess.run(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            capture_output=True, timeout=15, check=False)
+        to_kill: list[int] = []
+
+        def walk(p: int):
+            to_kill.append(p)
+            try:
+                with open(f"/proc/{p}/task/{p}/children") as f:
+                    for c in f.read().split():
+                        walk(int(c))
+            except OSError:
+                pass
+
+        walk(int(pid))
+        for p in reversed(to_kill):
+            try:
+                os.kill(p, 9)
+            except OSError:
+                pass
     except Exception:
         pass
 
