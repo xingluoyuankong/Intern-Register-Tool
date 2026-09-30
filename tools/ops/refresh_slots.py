@@ -18,7 +18,7 @@ import requests  # noqa: E402
 
 from src import config  # noqa: E402
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2]      # tools/ops/x.py -> 项目根
 SLOTS = ROOT / ".workbuddy-ai" / "proxypool" / "slots.txt"
 ACTIVE = ROOT / ".workbuddy-ai" / "proxypool" / "slots_active.txt"
 ENV = ROOT / ".env"
