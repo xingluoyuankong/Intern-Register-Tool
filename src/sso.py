@@ -147,7 +147,19 @@ class SSOClient:
         url = f"{self.gw}{path}"
         last = None
         for i in range(attempts):
-            r = self.session.post(url, headers=h, json=payload, timeout=self.timeout)
+            try:
+                r = self.session.post(url, headers=h, json=payload,
+                                      timeout=self.timeout)
+            except (requests.Timeout, requests.ConnectionError) as ex:
+                # 🔴 走 rotating 代理（Resin）时部分出口节点是黑洞：
+                #    POST 挂到 read timeout。这**不是**注册失败，是链路抖动
+                #    —— requests 的连接池会换连接，重试经常就好。
+                #    2026-09-30 实测：不重试的话整批以 network 错误收场。
+                last = ex
+                if i == attempts - 1:
+                    break
+                time.sleep(min(1.5 * (2 ** i), 8.0) + random.uniform(0, 1))
+                continue
             if self._is_waf_challenge(r):
                 last = r
                 if i == attempts - 1:
@@ -168,6 +180,8 @@ class SSOClient:
                 time.sleep(delay)
                 continue
             return r
+        if isinstance(last, requests.RequestException):
+            raise last
         last.raise_for_status()
         return last
 

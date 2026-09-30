@@ -23,6 +23,7 @@ def one_round() -> tuple[int, str]:
 
 
 def main():
+    print("[loop] started", flush=True)     # 启动即落一行 —— 死没死一眼可辨
     while True:
         t0 = time.strftime("%m-%d %H:%M:%S")
         try:
