@@ -46,11 +46,13 @@ for _ in range(3):
         time.sleep(0.4)
         continue
     ct = (r.headers.get("content-type") or "")
-    if "application/json" in ct and r.status_code < 500:
-        ok = True                  # 429/success/业务错误都算穿透
+    # 🔴 必须是业务层 200 JSON 才算真放行：429 虽然"穿过了 WAF"，但写接口
+    #    速率窗口没恢复，跑批量 8 个号全会以 429 失败（2026-09-30 实测）。
+    if r.status_code == 200 and "application/json" in ct:
+        ok = True
         print(f"gate: CLEARED {r.status_code} {r.text[:60]}", flush=True)
     else:
-        print(f"gate: blocked {r.status_code} {ct[:20]}", flush=True)
+        print(f"gate: blocked {r.status_code} {ct[:20]} {r.text[:40]}", flush=True)
     break
 else:
     print("gate: challenge loop (3x)", flush=True)
