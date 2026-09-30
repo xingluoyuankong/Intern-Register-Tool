@@ -74,8 +74,9 @@ def count_keys(where: str, remote=False) -> int:
           "print(len(s))")
     try:
         if remote:
-            out = sh(SSH + [f"cd /root/intern-register && .venv/bin/python -c \"{py}\""],
-                     timeout=60)
+            out = sh_ssh(
+                f"cd /root/intern-register && .venv/bin/python -c \"{py}\"",
+                timeout=60)
         else:
             out = sh([sys.executable, "-c", py], timeout=60)
         for ln in out.splitlines():
