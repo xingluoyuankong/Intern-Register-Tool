@@ -154,16 +154,10 @@ def server_round():
             crashed = True
     log(f"[srv] round w={workers} +{ok} crashed={crashed}")
 
-    # 自适应爬线程：内存充裕且本轮无崩溃 → 下一轮 +1；崩了 → -1
+    # 🔴 固定串行，不再爬线程：并发会被 WAF 按批量拦（同出口 IP 同时发多个
+    #    注册请求）。内存充裕也没用 —— 瓶颈不是资源，是风控。
     mem_ok, mem = server_mem_ok()
-    if crashed:
-        set_srv_workers(workers - 1)
-        log(f"[srv] workers {workers}->{workers - 1} (crashed, mem={mem})")
-    elif mem_ok and workers < 6:
-        set_srv_workers(workers + 1)
-        log(f"[srv] workers {workers}->{workers + 1} (mem={mem}) climbing")
-    else:
-        log(f"[srv] workers stay {workers} (mem={mem})")
+    log(f"[srv] serial mode, mem_avail={mem} crashed={crashed}")
 
 
 def local_round():
