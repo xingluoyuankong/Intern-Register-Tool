@@ -945,6 +945,9 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
             # 🔴 proxy 必须传**具体值**给这个 client，不能改全局 `IR_PROXY` ——
             #    多个 producer 同时改全局会互相踩（见 config.apply_proxy）。
             sso = SSOClient(proxy=(lease.url if lease else None))
+            # 种会话链（GET 注册页）：跳过它裸 POST 的挑战重放会被持续
+            # 挑战 —— 见 sso.prime_session 的终局实测注释。
+            sso.prime_session()
             ok = stage_register(mail, sso, rec, mail_domain=mail_domain, log=log,
                                 gate=reg_gate, should_stop=gov.hit,
                                 quota_scope=scope)

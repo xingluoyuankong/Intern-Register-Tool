@@ -233,6 +233,22 @@ class SSOClient:
         return r.json().get("data") is True
 
     # ── 注册 ──────────────────────────────────────────────────
+    def prime_session(self) -> None:
+        """GET 一次注册页，种下 `acw_tc` 会话链。
+
+        🔴 2026-09-30 终局实测：跳过这一步时，裸 POST 的挑战页重放即便
+        算法 cookie 正确也会被持续挑战（会话链断裂）；先 GET 种会话后，
+        首个 POST **直达业务层**（无挑战）。有头浏览器能过的原因同此 ——
+        它天然带了完整的 GET → JS → cookie 链。协议路径补上即等价。
+        """
+        try:
+            self.session.get(f"{config.SSO_BASE}/register",
+                             headers=self._headers("/register"),
+                             timeout=self.timeout)
+        except requests.RequestException:
+            # 种会话失败不致命：后面的 _post 遇到挑战页仍有算法兜底
+            pass
+
     def register(self, username: str, email: str, password: str) -> RegisterResult:
         payload = {
             "username": username,
