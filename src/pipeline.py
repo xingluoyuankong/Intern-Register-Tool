@@ -607,14 +607,24 @@ def stage_login_key(rec: AccountRecord, *, session=None, headless: bool = True,
             res = session.login(rec.email, rec.password,
                                 screenshot_prefix=screenshot_prefix,
                                 verbose=verbose,
-                                proxy=proxy or rec.proxy_slot or None)
+                                # 🔴 登录浏览器**默认不走代理**（2026-10-01 实测）：走 Resin 时
+                                #    Page.goto 120s 都超时（页面资源加载不动），而
+                                #    requests 走同一代理注册是通的。直连登录本来就能
+                                #    过（昨晚多个 login: ok）。要强制走代理设
+                                #    IR_LOGIN_USE_PROXY=1。
+                                proxy=(proxy if config.LOGIN_USE_PROXY else None))
         else:
             from .browser import login as browser_login
 
             res = browser_login(rec.email, rec.password, headless=headless,
                                 screenshot_prefix=screenshot_prefix,
                                 verbose=verbose,
-                                proxy=proxy or rec.proxy_slot or None)
+                                # 🔴 登录浏览器**默认不走代理**（2026-10-01 实测）：走 Resin 时
+                                #    Page.goto 120s 都超时（页面资源加载不动），而
+                                #    requests 走同一代理注册是通的。直连登录本来就能
+                                #    过（昨晚多个 login: ok）。要强制走代理设
+                                #    IR_LOGIN_USE_PROXY=1。
+                                proxy=(proxy if config.LOGIN_USE_PROXY else None))
         if not res.ok:
             raise RuntimeError(res.reason or "login failed")
         rec.jwt = res.jwt

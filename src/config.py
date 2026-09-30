@@ -53,6 +53,12 @@ WORKER_DOMAIN = os.getenv("IR_WORKER_DOMAIN", "")
 MAIL_PROVIDER = os.getenv("IR_MAIL_PROVIDER", "worker").strip().lower()
 
 TEMPTF_BASE = os.getenv("IR_TEMPTF_BASE", "https://temp.tf").strip()
+
+# 登录（浏览器建 key）是否走代理：默认关。
+# 实测走 Resin 时 Page.goto 连 120s 都超时（页面资源加载不动），
+# 而直连登录本来就能过。置 IR_LOGIN_USE_PROXY=1 强制登录也走槽位代理。
+LOGIN_USE_PROXY = os.getenv("IR_LOGIN_USE_PROXY", "0").strip().lower() in (
+    "1", "true", "yes", "on")
 # 建箱时按这个顺序降级（实测池子：outlook 25 / hotmail 26 / gmail 5 个账号）
 TEMPTF_PROVIDERS = [
     p.strip()
