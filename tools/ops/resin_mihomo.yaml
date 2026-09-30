@@ -1,0 +1,109 @@
+port: 7890
+allow-lan: false
+mode: direct
+log-level: warning
+external-controller: 127.0.0.1:19090
+
+proxies:
+  - name: slot1
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.QXpOVU5qNFJYVlRYVVRmVdKh1usrOuYf
+    password: x
+  - name: slot2
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.U3lzZmdnX25VdHFVQWdudFv5et_1t6OX
+    password: x
+  - name: slot3
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.SDEyemVHRk5relpaTUNKb34h7_LyuuOm
+    password: x
+  - name: slot4
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.WWloM2xSbTlNOTJGV3BhWPSs4a2cf3Wd
+    password: x
+  - name: slot5
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.OXZHQTVhUTNnTFBfRXlxbD99x3RClnsA
+    password: x
+  - name: slot6
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.aUN2VzRNUFVwZk9YenlYSfk51abFJWpI
+    password: x
+  - name: slot7
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.dmpZa2t2SENyUlVjRFZ3WZieXZLTMML2
+    password: x
+  - name: slot8
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.aUZvY1JhbElfUEZmdFNBaZNV2eLZq1kY
+    password: x
+  - name: slot9
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.MlVub3pmdXdRX0RaaWdBepKaiPg24Ngr
+    password: x
+  - name: slot10
+    type: http
+    server: resin-proxy.xzxyuan.ccwu.cc
+    port: 2268
+    username: Link.rl2.SkUzZVRSblZlVmU5OWZDQiYYLTrLvoe7
+    password: x
+
+listeners:
+  - name: in1
+    type: http
+    port: 7901
+    proxy: slot1
+  - name: in2
+    type: http
+    port: 7902
+    proxy: slot2
+  - name: in3
+    type: http
+    port: 7903
+    proxy: slot3
+  - name: in4
+    type: http
+    port: 7904
+    proxy: slot4
+  - name: in5
+    type: http
+    port: 7905
+    proxy: slot5
+  - name: in6
+    type: http
+    port: 7906
+    proxy: slot6
+  - name: in7
+    type: http
+    port: 7907
+    proxy: slot7
+  - name: in8
+    type: http
+    port: 7908
+    proxy: slot8
+  - name: in9
+    type: http
+    port: 7909
+    proxy: slot9
+  - name: in10
+    type: http
+    port: 7910
+    proxy: slot10

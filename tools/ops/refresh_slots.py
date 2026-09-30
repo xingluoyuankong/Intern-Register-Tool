@@ -32,6 +32,9 @@ def user_of(slot: str) -> str:
 def probe(slot: str, timeout: int = 15) -> str:
     """返回出口 IP；不通返回空串。"""
     s = requests.Session()
+    # 🔴 必须关掉 trust_env：环境里的 http_proxy/https_proxy 会静默盖掉
+    #    session.proxies（本机有系统代理，实测 7 秒全 BAD 就是这么来的）。
+    s.trust_env = False
     s.proxies = {"http": slot, "https": slot}
     try:
         ip = s.get("https://api.ipify.org?format=json",

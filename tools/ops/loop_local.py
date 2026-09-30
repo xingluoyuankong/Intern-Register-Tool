@@ -61,10 +61,10 @@ def main():
                         pass
                 if "API KEY" in ln:
                     log("  " + ln.strip()[:80])
-            log(f"round done, {ok} succeeded")
+            log(f"round done, +{ok} succeeded -> 立即下一轮")
         except subprocess.TimeoutExpired:
-            log("round timeout")
-        time.sleep(480)     # 歇 8 分钟
+            log("round timeout -> 立即下一轮")
+        # 🔴 不歇息：Resin 出口质量瞬变，screen→run 零间隔窗口最大化利用
 
 
 if __name__ == "__main__":
