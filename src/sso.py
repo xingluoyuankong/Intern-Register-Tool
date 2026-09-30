@@ -131,12 +131,22 @@ class SSOClient:
     def _solve_waf(self, r: requests.Response) -> None:
         """解挑战页 → 把 cookie 塞进本 session → 由调用方重放原请求。
 
-        优先**纯算法**（快、无浏览器、同 session 出口一致）；
-        arg1 形态不匹配（挑战升级）才退回浏览器求解（waf_bypass）。
+        🔴 主路径 = **JS 引擎执行页面里的动态算法**（`waf_js.solve_acw`）：
+        挑战页的混淆 JS 每次下发都不同（16715 字符的动态密钥数组，
+        2026-09-30 dump 确认），不存在通用固定算法 —— 只有执行它才对。
+        sso.py 里的 `_acw_sc_v2` 只匹配早期版本，降为兜底；
+        再不行才动用浏览器（waf_bypass.solve）。
 
         🔴 `acw_tc` 不用手动塞：首发响应的 `set-cookie` 已被 requests 自动
            收进 `self.session.cookies`（探针实测漏带它会被服务端**挂起**）。
         """
+        from .waf_js import solve_acw
+
+        val = solve_acw(r.text)
+        if val:
+            self.session.cookies.set(
+                "acw_sc__v2", val, domain="sso.openxlab.org.cn", path="/")
+            return
         import re as _re
 
         m = _re.search(r"arg1='([0-9A-Fa-f]{40})'", r.text)
@@ -195,18 +205,11 @@ class SSOClient:
                 last = r
                 if i == attempts - 1:
                     break
-                # 主路径：真实浏览器过 WAF 后在同一上下文发请求
-                # （代理与 requests 同串 —— 出口一致）
-                try:
-                    from .waf_bypass import WafSolver
-
-                    res = WafSolver.get().browser_post(
-                        f"{self.gw}{path}", payload, proxy=self.proxy)
-                    return _WrapResponse(res)
-                except Exception:
-                    # 兜底：算法 cookie 塞回 session 重放
-                    self._solve_waf(r)
-                    continue
+                # 🔴 主路径：纯算法 cookie（毫秒级、零依赖；2026-09-30 直连
+                #    实测穿透 WAF 直达业务层）。browser_post 是兜底：有头
+                #    Chromium 依赖 Xvfb 存活，环境残缺时反而拖垮产线。
+                self._solve_waf(r)
+                continue
             if r.status_code == 429 or r.status_code >= 500:
                 last = r
                 if i == attempts - 1:
