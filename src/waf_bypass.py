@@ -194,28 +194,32 @@ class WafSolver:
 
         pw = sync_playwright().start()
         atexit.register(kill_driver_tree, pw)
-        # 🔴 headless 特征（UA HeadlessChrome / navigator.webdriver）会被
-        #    WAF 二层级识别并 405（2026-09-30 实测：首页 JS 能过、fetch 被
-        #    拦，UA 覆盖+webdriver 隐藏也不够）→ 改**有头** chromium 跑在
-        #    QwenPaw 自带的 Xvfb（DISPLAY=:1）上，特征与真人一致，实测穿透。
-        #    完整版 chromium 随 `playwright install chromium` 一起装了。
-        # 🔴 Xvfb 会被平台间歇性杀掉：launch 失败不能崩线程 —— 置死标志，
-        #    后续请求直接 err（调用方有算法兜底，产线不中断）。
+        # 🔴 headless 特征可能被 WAF 二层级识别（405）；有头更真。
+        #    但**有头需要 XServer + 完整版 chromium**：服务器有 Xvfb（:1）
+        #    且装了完整 chromium → 有头；本机通常只有 headless shell →
+        #    退回无头。两条都能解挑战（cookie 计算不依赖渲染）。
         os.environ.setdefault("DISPLAY", ":1")
+        browser = None
         try:
             browser = pw.chromium.launch(
                 headless=False,
                 args=["--no-sandbox", "--disable-dev-shm-usage",
                       "--disable-blink-features=AutomationControlled"])
-        except Exception as ex:  # noqa: BLE001
-            self._browser_dead = str(ex)[:200]
-            while True:
-                item = self._req_q.get()
-                if item is None:
-                    return
-                self._resp_q.put((
-                    "err", f"browser unavailable: {self._browser_dead}"))
-            return
+        except Exception:  # noqa: BLE001 无 XServer / 无完整 chromium
+            try:
+                browser = pw.chromium.launch(
+                    executable_path=find_headless_browser(),
+                    headless=True,
+                    args=["--no-sandbox", "--disable-dev-shm-usage"])
+            except Exception as ex:  # noqa: BLE001
+                self._browser_dead = str(ex)[:200]
+                while True:
+                    item = self._req_q.get()
+                    if item is None:
+                        return
+                    self._resp_q.put((
+                        "err", f"browser unavailable: {self._browser_dead}"))
+                return
 
         def _do_solve(challenge_html: str) -> dict[str, str]:
             """[兜底] 假页面执行挑战 JS，读 cookie（独立 context，用完即关）。"""
