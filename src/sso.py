@@ -79,13 +79,47 @@ class SSOClient:
         return ("text/html" in ct
                 and ("acw_sc__v2" in r.text or "aliyunwaf" in r.text))
 
+    # 阿里云 WAF 初级挑战的标准算法（公开逆向结论，2026-09-30 实测有效）：
+    # arg1（服务端 40 位 hex）与固定 mask 逐字节异或，再按位置表重排。
+    # 🔴 为什么不再用浏览器算（历史见 waf_bypass.py）：Resin 网关是
+    #    **每请求轮换出口**（实测同用户名 4 发 3 个不同 IP），浏览器算出
+    #    cookie 的出口与 requests 重放的出口必然不同，实测重放仍被拦。
+    #    纯算法在同一个 session 内"首发→算→重放"，连接复用保住出口，
+    #    2026-09-30 服务器实测：重放拿到 429 JSON（业务限流）——穿透成功。
+    _WAF_MASK = "3000176000856006061501533003690027800375"
+    _WAF_POS = [15, 35, 29, 24, 33, 16, 1, 38, 10, 9, 19, 31, 40, 27, 22, 23,
+                25, 13, 6, 11, 39, 18, 20, 8, 14, 21, 32, 26, 2, 30, 7, 4, 17,
+                5, 3, 28, 34, 37, 12, 36]
+
+    @classmethod
+    def _acw_sc_v2(cls, arg1: str) -> str:
+        mask, pos = cls._WAF_MASK, cls._WAF_POS
+        xored = []
+        for i in range(0, min(len(mask), len(arg1)), 2):
+            xored.append(f"{int(mask[i:i + 2], 16) ^ int(arg1[i:i + 2], 16):02x}")
+        res = [""] * 40
+        for i, p in enumerate(pos):
+            if i < len(xored):
+                res[p - 1] = xored[i]
+        return "".join(res)
+
     def _solve_waf(self, r: requests.Response) -> None:
         """解挑战页 → 把 cookie 塞进本 session → 由调用方重放原请求。
 
+        优先**纯算法**（快、无浏览器、同 session 出口一致）；
+        arg1 形态不匹配（挑战升级）才退回浏览器求解（waf_bypass）。
+
         🔴 `acw_tc` 不用手动塞：首发响应的 `set-cookie` 已被 requests 自动
            收进 `self.session.cookies`（探针实测漏带它会被服务端**挂起**）。
-           这里只补浏览器算出的 `acw_sc__v2`。
         """
+        import re as _re
+
+        m = _re.search(r"arg1='([0-9A-Fa-f]{40})'", r.text)
+        if m:
+            self.session.cookies.set(
+                "acw_sc__v2", self._acw_sc_v2(m.group(1)),
+                domain="sso.openxlab.org.cn", path="/")
+            return
         from .waf_bypass import WafSolver
 
         cookies = WafSolver.get().solve(r.text)
