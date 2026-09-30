@@ -9,6 +9,7 @@
   1. 服务器：screen_slots（POST 级筛）→ 有 CLEAR 就 run（workers 2，稳）
   2. 本机：screen_slots → 有 CLEAR 就 run
 """
+import os
 import subprocess
 import sys
 import time
@@ -192,7 +193,10 @@ def local_round():
 
 
 if __name__ == "__main__":
-    log("loop_all started (server via SSH + local)")
+    # 🔴 低频高效，不瞎撞：每轮先筛（限并发 8）→ 只跑真 CLEAR 槽位 →
+    #    跑完歇 COOLDOWN。高频乱撞只会把出口段打进 405（10-01 教训）。
+    COOLDOWN = int(os.getenv("IR_LOOP_COOLDOWN", "900"))
+    log(f"loop_all started (cooldown={COOLDOWN}s)")
     while True:
         try:
             server_round()
@@ -204,3 +208,5 @@ if __name__ == "__main__":
             log(f"[loc] EXC {type(ex).__name__}: {str(ex)[:100]}")
         log(f"cycle done | srv_keys={count_keys('srv', remote=True)} "
             f"loc_keys={count_keys('loc')}")
+        log(f"cool down {COOLDOWN}s")
+        time.sleep(COOLDOWN)
