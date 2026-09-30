@@ -85,16 +85,26 @@ def _run_mini_racer(code: str) -> str:
 
 
 def _run_node(code: str) -> str:
-    # node 不会打印普通变量 —— 末尾显式 console.log 才拿得到结果
-    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
-        f.write(code + "\ntry{console.log(String(document.cookie));}catch(e){}")
-        path = f.name
-    try:
-        out = subprocess.run(["node", path], capture_output=True, text=True,
-                             timeout=30, encoding="utf-8", errors="replace")
-        return (out.stdout or "").strip()
-    finally:
-        Path(path).unlink(missing_ok=True)
+    # 🔴 两个坑：
+    #   1. 混淆脚本会劫持 console.log（反调试）→ 不能用 console 取结果，
+    #      改 fs.writeFileSync 落盘再读；
+    #   2. .js 可能被当 ESM 加载 → 用 .cjs。
+    with tempfile.TemporaryDirectory() as d:
+        js = Path(d) / "ch.cjs"
+        out = Path(d) / "out.txt"
+        js.write_text(
+            code + f"\ntry {{ require('fs').writeFileSync("
+                   f"{str(out)!r}, String(document.cookie)); }} catch (e) {{}}",
+            encoding="utf-8")
+        try:
+            subprocess.run(["node", str(js)], capture_output=True,
+                           timeout=30, check=False)
+        except Exception:  # noqa: BLE001
+            return ""
+        try:
+            return out.read_text(encoding="utf-8")
+        except OSError:
+            return ""
 
 
 def solve_acw(html: str) -> str:
