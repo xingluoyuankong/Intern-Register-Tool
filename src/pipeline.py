@@ -461,11 +461,12 @@ def stage_register(mail: TempMailClient, sso: SSOClient, rec: AccountRecord,
         # 邮箱是 Worker 刚建的，不可能已注册。
         # 万一撞上（地址被回收复用），register 本身会报错，不影响正确性。
         t = time.time()
+        # 🔴 不再做 `check_username` 前置查询（2026-10-01 对照实验根因）：
+        #    register 前的这次 POST 会触发 WAF 挑战并污染会话链，导致
+        #    随后的注册被**无限挑战**。对照数据：直接发 register 的
+        #    screen_slots 同一批槽位 10/50 穿透；带 check_username 的
+        #    run.py 0/10 全败。用户名撞车时 register 本身会报错重试。
         username = gen_username()
-        for _ in range(6):
-            if sso.check_username(username):
-                break
-            username = gen_username()
         rec.username = username
         rec.password = gen_password()
         mark("username", t)
@@ -482,6 +483,11 @@ def stage_register(mail: TempMailClient, sso: SSOClient, rec: AccountRecord,
                 f"已确认 {QUOTA_MSG_CODE}（累计配额触顶），未发注册请求")
 
         t = time.time()
+        # 🔴 会话链必须**紧贴**注册请求重建：screen_slots（prime→register
+        #    零间隔）同一批槽位 10/50 穿透，而把 prime 放在建邮箱/限速
+        #    等待之前的 run.py 是 0/10。会话链有时效，隔了几秒就废 ——
+        #    这里在注册发请求前再种一次，把窗口压到最小。
+        sso.prime_session()
         reg = sso.register(rec.username, rec.email, rec.password)
         mark("register_call", t)
         if not reg.ok:

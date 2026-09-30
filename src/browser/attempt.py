@@ -36,7 +36,9 @@ def _step_open_form(page, st: _AttemptState):
     返回 `acc_box`（账号输入框 locator），供 `_step_type_credentials` 复用 ——
     原实现就是在这一步创建、下一步复用的，这里保持同一对象。
     """
-    page.goto(build_login_url(), wait_until="domcontentloaded", timeout=60000)
+    # 🔴 走代理后页面加载明显变慢（实测 60s 会超时，直连时够用）→ 放宽到
+    #    120s，并让 goto 只等 domcontentloaded（验证码是后续轮询等的）。
+    page.goto(build_login_url(), wait_until="domcontentloaded", timeout=120000)
     st.mark("goto")
 
     # 🔬 预加载实验：页面加载后先闲置一段再操作（原理见 PREWARM_MS）。
