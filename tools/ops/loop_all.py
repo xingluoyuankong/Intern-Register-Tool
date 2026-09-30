@@ -57,7 +57,32 @@ def count_keys(where: str, remote=False) -> int:
     return -1
 
 
+def srv_workers() -> int:
+    """自适应线程数：内存够且上轮正常就 +1，异常就 -1。状态落盘。"""
+    f = ROOT / ".workbuddy-ai" / "srv_workers.txt"
+    try:
+        return max(2, min(6, int(f.read_text().strip())))
+    except Exception:  # noqa: BLE001
+        f.write_text("2")
+        return 2
+
+
+def set_srv_workers(n: int) -> None:
+    n = max(2, min(6, n))
+    (ROOT / ".workbuddy-ai" / "srv_workers.txt").write_text(str(n))
+
+
+def server_mem_ok() -> tuple[bool, str]:
+    out = sh(SSH + ["free -m | awk 'NR==2{print $7}'"], timeout=30)
+    try:
+        avail = int(out.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return True, "?"
+    return avail > 1100, f"{avail}M"
+
+
 def server_round():
+    workers = srv_workers()
     log("[srv] screen...")
     out = sh(SSH + ["cd /root/intern-register && timeout 420 "
                     ".venv/bin/python -u tools/ops/screen_slots.py"], timeout=450)
@@ -68,16 +93,17 @@ def server_round():
                 n = int(ln.split()[1].split("/")[0])
             except (ValueError, IndexError):
                 pass
-    log(f"[srv] screen -> {n} usable")
+    log(f"[srv] screen -> {n} usable | workers={workers}")
     if n < 1:
         return
-    count = min(n * 2, 6)
-    workers = min(n, 2)
+    count = min(n * 2, 8)
+    workers = min(workers, n)
     log(f"[srv] run --count {count} --workers {workers}")
     out = sh(SSH + [f"cd /root/intern-register && timeout 800 "
                     f".venv/bin/python -u run.py --count {count} "
                     f"--workers {workers}"], timeout=830)
     ok = 0
+    crashed = False
     for ln in out.splitlines():
         if "API KEY" in ln:
             log("  [srv] " + ln.strip()[:70])
@@ -86,7 +112,22 @@ def server_round():
                 ok = int(ln.split("本次成功")[1].split("个")[0].strip())
             except (ValueError, IndexError):
                 pass
-    log(f"[srv] round +{ok}")
+        if "Worker process" in ln and "exited" in ln:
+            crashed = True
+        if "MemoryError" in ln or "OOM" in ln:
+            crashed = True
+    log(f"[srv] round w={workers} +{ok} crashed={crashed}")
+
+    # 自适应爬线程：内存充裕且本轮无崩溃 → 下一轮 +1；崩了 → -1
+    mem_ok, mem = server_mem_ok()
+    if crashed:
+        set_srv_workers(workers - 1)
+        log(f"[srv] workers {workers}->{workers - 1} (crashed, mem={mem})")
+    elif mem_ok and workers < 6:
+        set_srv_workers(workers + 1)
+        log(f"[srv] workers {workers}->{workers + 1} (mem={mem}) climbing")
+    else:
+        log(f"[srv] workers stay {workers} (mem={mem})")
 
 
 def local_round():
