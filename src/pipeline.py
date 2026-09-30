@@ -578,7 +578,7 @@ def stage_register(mail: TempMailClient, sso: SSOClient, rec: AccountRecord,
 def stage_login_key(rec: AccountRecord, *, session=None, headless: bool = True,
                     key_name: str = "default", verbose: bool = True,
                     screenshot_prefix: str = None, log=print,
-                    verify: bool = True) -> bool:
+                    verify: bool = True, proxy: str = None) -> bool:
     """Stage 3+4+5。
 
     session: 若传入 `BrowserSession`，复用它（批量场景）；否则自建浏览器。
@@ -600,12 +600,15 @@ def stage_login_key(rec: AccountRecord, *, session=None, headless: bool = True,
         if session is not None:
             res = session.login(rec.email, rec.password,
                                 screenshot_prefix=screenshot_prefix,
-                                verbose=verbose)
+                                verbose=verbose,
+                                proxy=proxy or rec.proxy_slot or None)
         else:
             from .browser import login as browser_login
 
             res = browser_login(rec.email, rec.password, headless=headless,
-                                screenshot_prefix=screenshot_prefix, verbose=verbose)
+                                screenshot_prefix=screenshot_prefix,
+                                verbose=verbose,
+                                proxy=proxy or rec.proxy_slot or None)
         if not res.ok:
             raise RuntimeError(res.reason or "login failed")
         rec.jwt = res.jwt
@@ -841,9 +844,10 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
                         with print_lock:
                             print(f"[{idx + 1}/{count}] "
                                   f"login+key: {rec.email}", flush=True)
-                        stage_login_key(
-                            rec, session=sess, key_name=key_name,
-                            verbose=False, log=make_log(idx), verify=False,
+                            stage_login_key(
+                                rec, session=sess, key_name=key_name,
+                                verbose=False, log=make_log(idx), verify=False,
+                                proxy=rec.proxy_slot or None,
                             screenshot_prefix=(f"{screenshot_prefix}_{idx + 1}"
                                                if screenshot_prefix else None),
                         )
@@ -931,7 +935,7 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
                 #    `slots.txt` 增删条目整体错位，把配额记到别的 IP 头上
                 #    （本项目实测已发生过，见 config.SLOT_EGRESS_IPS 的说明）。
                 scope = config.slot_scope(lease.url)
-                rec.proxy_slot = str(lease)
+                rec.proxy_slot = lease.url      # 🔴 必须是**槽位串**
                 log(f"出口槽位 {lease}（配额记在 {scope} 名下）")
                 # 这个出口自己的配额（不是全局的 —— 见 quota.status 的说明）。
                 # 复查的判据在 `QuotaGovernor.claim_slot`（理由也写在那里）。

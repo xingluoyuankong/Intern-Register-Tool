@@ -229,11 +229,16 @@ def _build_result(st: _AttemptState, *, cookies: dict, waited: int) -> LoginResu
 # ────────────────────────────────────────────────────────────────
 def _run_attempt(browser, *, account: str, password: str, headless: bool,
                  timeout: int, screenshot_prefix: str = None,
-                 verbose: bool = False, tag: str = "") -> LoginResult:
+                 verbose: bool = False, tag: str = "",
+                 proxy: str = None) -> LoginResult:
     """在给定 browser 上跑一次登录尝试。
 
     这里**只负责编排**：建 context → 注册响应回调 → 依次调用 8 个步骤 → 折结果。
     每一步的实现见上面的 `_step_*`，状态在 `_AttemptState`。
+
+    proxy: 🔴 传入则走代理出口。不给就直连 —— 直连会踩服务器公网 IP 的
+        WAF 405/限流，登录直接 net::ERR_CONNECTION 失败（注册激活都 ok 却
+        拿不到 key 的真因，见 2026-09-30 台账）。
     """
     st = _AttemptState(verbose=verbose)
 
@@ -244,6 +249,8 @@ def _run_attempt(browser, *, account: str, password: str, headless: bool,
         viewport=None,
         color_scheme="light",
     )
+    if proxy:
+        ctx_kwargs["proxy"] = {"server": proxy}
     if headless:
         # 唯一的 UA 覆盖：去掉 HeadlessChrome 自我标记，版本号原样保留。
         # Chrome 的 reduced UA 只用主版本号（Chrome/152.0.0.0），

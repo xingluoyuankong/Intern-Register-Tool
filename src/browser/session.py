@@ -152,13 +152,17 @@ class BrowserSession:
 
     def login(self, account: str, password: str, *, timeout: int = 150,
               attempts: int = 3, cooldown: float = 15.0,
-              screenshot_prefix: str = None, verbose: bool = False) -> LoginResult:
-        """在复用的浏览器上登录，失败换新 context 重试。"""
+              screenshot_prefix: str = None, verbose: bool = False,
+              proxy: str = None) -> LoginResult:
+        """在复用的浏览器上登录，失败换新 context 重试。
+
+        proxy: 该账号走哪个出口（每个账号独立 context，可各走各的槽位）。
+        """
         def run_once(tag):
             return _run_attempt(self._browser, account=account, password=password,
                                 headless=self.headless, timeout=timeout,
                                 screenshot_prefix=screenshot_prefix,
-                                verbose=verbose, tag=tag)
+                                verbose=verbose, tag=tag, proxy=proxy)
 
         return _retry_loop(run_once, attempts=attempts, cooldown=cooldown,
                            verbose=verbose, retry_hint="重试")

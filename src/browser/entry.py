@@ -15,12 +15,17 @@ from .state import LoginResult
 def login(account: str, password: str, *, headless: bool = True,
           timeout: int = 150, attempts: int = 3, cooldown: float = 15.0,
           screenshot_prefix: str = None, verbose: bool = False,
-          chrome_args=None) -> LoginResult:
+          chrome_args=None, proxy: str = None) -> LoginResult:
     """用真实浏览器登录 SSO，返回 JWT。
 
     单账号场景用这个；批量场景请用 `BrowserSession` 复用浏览器进程。
 
     Args:
+        proxy: 🔴 **代理串**（`http://user:pass@host:port`）。不给就直连 ——
+            实测直连会踩服务器公网 IP（47.84.122.196）的 WAF 405/限流，
+            表现为「register: ok, activate: ok，但 login: net::ERR_CONNECTION」
+            即注册激活都成了却拿不到 key（2026-09-30 批量零产出的真因）。
+            必须把注册用的同一个 Resin 槽位传进来，全流程同出口。
         account: 邮箱 / 手机号 / 用户名
         password: 明文密码
         headless: 无头模式。**默认 True**（实测可用，3/3 通过，见文件头说明）。
@@ -50,7 +55,7 @@ def login(account: str, password: str, *, headless: bool = True,
             return _run_attempt(browser, account=account, password=password,
                                 headless=headless, timeout=timeout,
                                 screenshot_prefix=screenshot_prefix,
-                                verbose=verbose, tag=tag)
+                                verbose=verbose, tag=tag, proxy=proxy)
         finally:
             kill_driver_tree(p)
 
