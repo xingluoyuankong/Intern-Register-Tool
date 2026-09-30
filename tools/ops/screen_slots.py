@@ -36,7 +36,12 @@ def user_of(slot: str) -> str:
 def probe(slot: str, label: str) -> tuple[str, str, str]:
     """返回 (verdict, exit_ip, slot)。"""
     tag = str(int(time.time()))[-6:]
-    email = f"sc{label}{tag}@example.invalid"
+    # 🔴 必须用**与真实注册一致**的邮箱域名探测，不能用 example.invalid：
+    #    非法邮箱会被业务层秒回（格式错误），WAF 根本不拦 → 判成 CLEAR，
+    #    但真邮箱走同一出口时照样被挑战。实测后果：screen 报 6 个可用、
+    #    真注册 8 号全部秒失败（10-01 00:53 轮）。改用 outlook.com 后
+    #    CLEAR 才等价于"这个出口真能注册"。
+    email = f"sc{label}{tag}@outlook.com"
     payload = {
         "username": f"sc{label}{tag}",
         "email": email,
