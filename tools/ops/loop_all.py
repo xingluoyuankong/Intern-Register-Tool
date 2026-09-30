@@ -128,8 +128,12 @@ def server_round():
     log(f"[srv] screen -> {n} usable | workers={workers}")
     if n < 1:
         return
-    count = min(n * 2, 8)
-    workers = min(workers, n)
+    count = min(n * 2, 6)
+    # 🔴 必须串行：Resin 多个槽位会共用同一出口 IP（screen 实测
+    #    186.167.53.178 同时出现在两个槽位），并发 = 同 IP 同时发多个
+    #    注册请求 → WAF 按批量拦（对照：单线程走代理 registered ok，
+    #    3 并发全败）。速度靠多轮次补，不靠并发。
+    workers = 1
     log(f"[srv] run --count {count} --workers {workers}")
     out = sh_ssh(f"cd /root/intern-register && timeout 800 "
                      f".venv/bin/python -u run.py --count {count} "
@@ -176,7 +180,7 @@ def local_round():
     if n < 1:
         return
     count = min(n * 2, 4)
-    workers = min(workers, n)
+    workers = 1   # 同上：串行避开发同出口并发
     log(f"[loc] run --count {count} --workers {workers}")
     # 🔴 登录建 key 是浏览器 + 验证码，单号 60~120s，批量号数要留足时间：
     #    4 号实测要 14min+（count=4/timeout=900 被截断过一次）。
