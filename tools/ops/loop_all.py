@@ -17,7 +17,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 LOG = ROOT / ".workbuddy-ai" / "loop_all.log"
 SSH = ["ssh", "-o", "UserKnownHostsFile=.workbuddy-ai/ssh/known_hosts",
-       "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "qwenpaw-tom"]
+       "-o", "BatchMode=yes", "-o", "ConnectTimeout=20",
+       "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=2",
+       "qwenpaw-tom"]
 
 
 def log(*a):
@@ -31,6 +33,34 @@ def sh(args, timeout=600) -> str:
     r = subprocess.run(args, capture_output=True, text=True, timeout=timeout,
                        encoding="utf-8", errors="replace", cwd=str(ROOT))
     return (r.stdout or "") + (r.stderr or "")
+
+
+def sh_ssh(remote_cmd: str, timeout=600) -> str:
+    """SSH 执行远端命令（带心跳 + 强杀，防止隧道断连后 subprocess 假死）。
+
+    🔴 实测坑：QwenPaw 隧道会静默断连，此时 `subprocess.run(timeout=)`
+    **不会**超时 —— 它卡在等 stdout 管道关闭上（ssh 子进程不会自己退出），
+    整个大脑就挂死（22:54 起停摆 47 分钟就是这个原因）。
+    解法：Popen + communicate(timeout) + 超时后 taskkill /T 杀进程树，
+    并用 ServerAliveInterval 让 ssh 尽早发现对端死亡。
+    """
+    args = SSH + [remote_cmd]
+    p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, encoding="utf-8", errors="replace",
+                         cwd=str(ROOT))
+    try:
+        out, _ = p.communicate(timeout=timeout)
+        return out or ""
+    except subprocess.TimeoutExpired:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(p.pid)],
+                           capture_output=True, timeout=30)
+        except Exception:  # noqa: BLE001
+            try:
+                p.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        return "TIMEOUT"
 
 
 def count_keys(where: str, remote=False) -> int:
@@ -73,7 +103,7 @@ def set_srv_workers(n: int) -> None:
 
 
 def server_mem_ok() -> tuple[bool, str]:
-    out = sh(SSH + ["free -m | awk 'NR==2{print $7}'"], timeout=30)
+    out = sh_ssh("free -m | awk 'NR==2{print $7}'", timeout=30)
     try:
         avail = int(out.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -84,8 +114,8 @@ def server_mem_ok() -> tuple[bool, str]:
 def server_round():
     workers = srv_workers()
     log("[srv] screen...")
-    out = sh(SSH + ["cd /root/intern-register && timeout 420 "
-                    ".venv/bin/python -u tools/ops/screen_slots.py"], timeout=450)
+    out = sh_ssh("cd /root/intern-register && timeout 420 "
+                    ".venv/bin/python -u tools/ops/screen_slots.py", timeout=450)
     n = 0
     for ln in out.splitlines():
         if "usable" in ln:
@@ -99,9 +129,9 @@ def server_round():
     count = min(n * 2, 8)
     workers = min(workers, n)
     log(f"[srv] run --count {count} --workers {workers}")
-    out = sh(SSH + [f"cd /root/intern-register && timeout 800 "
-                    f".venv/bin/python -u run.py --count {count} "
-                    f"--workers {workers}"], timeout=830)
+    out = sh_ssh(f"cd /root/intern-register && timeout 800 "
+                     f".venv/bin/python -u run.py --count {count} "
+                     f"--workers {workers}", timeout=830)
     ok = 0
     crashed = False
     for ln in out.splitlines():
