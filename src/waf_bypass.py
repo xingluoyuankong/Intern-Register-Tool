@@ -1,27 +1,25 @@
-"""阿里云 WAF（acw_sc__v2 JS 挑战）破解器。
+"""阿里云 WAF（acw_sc__v2 JS 挑战）破解器 —— 浏览器内闭环发注册请求。
 
-2026-09-30 实测：`sso.openxlab.org.cn` 的写接口（`/register/byEmail` 等）开始
-返回阿里云 WAF 的 JS 挑战页（HTTP 200 + `text/html`，内含 `arg1` 与混淆 JS），
-`requests` 拿到的是 HTML 而不是 JSON —— 纯 HTTP 路径整个被打断。
+2026-09-30 实测的三个阶段（都撞过，结论在这）：
 
-破解原理（`_probe_waf.py` 实测通过，注册返回 `success:true`）：
-  1. 挑战页自带完整算法：`setCookie("acw_sc__v2", x)` 由页内混淆 JS 算出。
-  2. 用真实浏览器执行这段 JS（把 `document.location.reload()` 替换掉防死循环），
-     cookie 就落在浏览器 context 里 —— **同源**（route 到 sso.openxlab.org.cn
-     的假页面）保证 cookie 域正确。
-  3. 把 `acw_sc__v2` + 首发响应的 `acw_tc` 一起塞回 `requests.Session`，重放原
-     POST → 拿到 JSON。
+  ① `requests` 直发 → 挑战页 HTML（HTTP 200 + `arg1` 混淆 JS），不是 JSON。
+  ② 「requests 首发zal → 浏览器算 cookie → requests 重放」：要求三步同出口。
+     Resin 网关是**每请求轮换出口**（同用户名 4 发 3 个不同 IP 实测），
+     三步跨三个出口必然失败；昨晚 batch3 成功纯属当时出口稳定。
+  ③ 纯 python 算法（arg1 异或+重排，见 sso.py `_acw_sc_v2`）不跨出口了，
+     重放能拿到响应 —— 但会话信誉低，网关对低分会话 429 限流。
 
-🔴 三个实测坑（都写在调用方注释里，这里只存结论）：
-  - 只带 `acw_sc__v2` 不带 `acw_tc`：请求被**挂起**不响应；
-  - 重放必须与首发走**同一条网络路径**（同代理配置），换路径也会挂起；
-  - `browser.close()` / `sync_playwright().stop()` 在本机会**挂死**
-    （系统 Chrome 与 headless shell 都一样）→ 本模块的浏览器**从不 close**，
-    进程退出用 `atexit` 杀 driver 进程树兜底。
+  终极解（本文件现状）：**让真实浏览器发注册请求** ——
+  `page.goto(sso/register)` 时 WAF JS 在真实环境自动执行（高信誉），
+  然后同一页面上下文内 `fetch()` 注册 POST，cookie/出口/信誉天然一致。
+  返回 `{"status": int, "text": str}`，由调用方包装。
 
-并发模型：Playwright 同步 API 绑定创建线程，而注册的 producer 是多线程 ——
-所以 playwright 跑在**专用线程**里，`solve()` 经队列跨线程提交，任意线程可调。
-整个进程共用一个浏览器（challenge 页无状态，cookie 每次现算）。
+🔴 实测坑（只存结论）：
+  - `browser.close()` / `sync_playwright().stop()` 在本机会**挂死** →
+    本模块的浏览器从不 close，退出用 `atexit` + `kill_driver_tree` 兜底；
+  - headless shell 在三平台的可执行文件路径见 `find_headless_browser`；
+  - playwright 同步 API 绑定创建线程 → 全部 playwright 操作都在
+    专用线程（`_loop`）里，对外经队列提交，任意线程可调。
 """
 
 import atexit
@@ -30,6 +28,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 
 from . import config
 
@@ -40,11 +39,10 @@ def find_headless_browser() -> str:
 
     顺序：`IR_WAF_BROWSER_PATH` → playwright 缓存里**最新**的
     chromium_headless_shell → 回退 `config.CHROME_PATH`。
-    三平台缓存布局（playwright ≥1.49 实测，headless shell 独立成包后
-    各平台目录名统一为 chrome-headless-shell-<os><arch>，可执行文件两套名都有）：
+    三平台缓存布局（playwright ≥1.49，headless shell 独立成包后
+    各平台目录名统一为 chrome-headless-shell-<os><arch>）：
       Windows  ~/AppData/Local/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-win64/chrome-headless-shell.exe
       Linux    ~/.cache/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-linux64/chrome-headless-shell
-               （旧布局 chrome-linux*/headless_shell 仍兼容）
       macOS    ~/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-mac*/chrome-headless-shell
     """
     env = os.getenv("IR_WAF_BROWSER_PATH", "").strip()
@@ -83,8 +81,7 @@ def kill_driver_tree(pw) -> None:
     返回）。playwright 没有官方的"浏览器进程 PID"接口，而 driver（node）是
     python 的子进程、chrome 是 node 的子进程，所以杀 driver 的进程树 =
     全部收掉。Windows 用 `taskkill /F /T`；POSIX 递归读
-    `/proc/<pid>/task/<tid>/children` 自顶向下 SIGKILL（不递归会漏掉
-    chrome 的多级子进程，它们被 init 收养后仍驻留）。
+    `/proc/<pid>/task/<tid>/children` 自顶向下 SIGKILL。
     """
     if pw is None:
         return
@@ -103,7 +100,7 @@ def kill_driver_tree(pw) -> None:
         except Exception:
             pass
         return
-    # POSIX：/proc 遍历，先杀叶子再杀根，最后兜底整组
+    # POSIX：/proc 遍历，先杀叶子再杀根
     try:
         to_kill: list[int] = []
 
@@ -128,7 +125,7 @@ def kill_driver_tree(pw) -> None:
 
 # ── 破解器 ───────────────────────────────────────────────────────
 class WafSolver:
-    """单例。`solve(challenge_html) -> dict[name, value]`，任意线程可调。"""
+    """单例。任意线程可调；playwright 生命周期全部在专用线程里。"""
 
     _lock = threading.Lock()
     _instance = None
@@ -148,26 +145,33 @@ class WafSolver:
 
     # ── 对外 ─────────────────────────────────────────────────
     def solve(self, challenge_html: str) -> dict[str, str]:
-        """算出挑战页要求的 cookie（阻塞，最长 `WAF_SOLVE_TIMEOUT` 秒）。
+        """[兜底] 算出挑战页要求的 cookie（阻塞，最长 `WAF_SOLVE_TIMEOUT` 秒）。"""
+        self._ensure_started()
+        self._req_q.put(("solve", challenge_html))
+        return self._wait()
 
-        返回浏览器 context 里的**全部** cookie（至少含 `acw_sc__v2`；
-        `acw_tc` 由调用方从首发响应的 set-cookie 里拿 —— 假页面产生不了它）。
+    def browser_post(self, path: str, payload: dict) -> dict:
+        """[主路径] 真实浏览器过 WAF 后，在同一上下文 fetch 注册接口。
+
+        返回 `{"status": int, "text": str}`。阻塞至多 `WAF_SOLVE_TIMEOUT` 秒。
         """
         self._ensure_started()
-        self._req_q.put(challenge_html)
-        try:
-            kind, val = self._resp_q.get(timeout=config.WAF_SOLVE_TIMEOUT)
-        except queue.Empty as ex:
-            raise RuntimeError(
-                f"WAF cookie 计算超时（>{config.WAF_SOLVE_TIMEOUT}s）"
-                f"—— 浏览器没在跑？") from ex
-        if kind == "err":
-            raise RuntimeError(f"WAF cookie 计算失败: {val}")
-        return val
+        self._req_q.put(("post", (path, payload)))
+        return self._wait()
 
     def shutdown(self):
         """杀 driver 进程树（run.py 收尾时调用；atexit 也会兜一次）。"""
         self._req_q.put(None)
+
+    def _wait(self):
+        try:
+            kind, val = self._resp_q.get(timeout=config.WAF_SOLVE_TIMEOUT)
+        except queue.Empty as ex:
+            raise RuntimeError(
+                f"WAF 求解超时（>{config.WAF_SOLVE_TIMEOUT}s）") from ex
+        if kind == "err":
+            raise RuntimeError(f"WAF 求解失败: {val}")
+        return val
 
     # ── 专用线程 ─────────────────────────────────────────────
     def _ensure_started(self):
@@ -190,29 +194,56 @@ class WafSolver:
             args=["--no-sandbox", "--disable-dev-shm-usage"])
         ctx = browser.new_context()
         page = ctx.new_page()
-        self._current_html = ""
 
-        def _fulfill(route):
-            route.fulfill(status=200,
-                          content_type="text/html; charset=utf-8",
-                          body=self._current_html)
+        def _do_solve(challenge_html: str) -> dict[str, str]:
+            """[兜底] 假页面执行挑战 JS，读 cookie。"""
+            html = challenge_html.replace(
+                "document.location.reload()", "void 0;")
+            page.route(f"{config.SSO_BASE}/__waf_probe", lambda route: (
+                route.fulfill(status=200,
+                              content_type="text/html; charset=utf-8",
+                              body=html)))
+            page.goto(f"{config.SSO_BASE}/__waf_probe",
+                      wait_until="load", timeout=20000)
+            page.wait_for_timeout(1500)     # 给混淆 JS 一点执行时间
+            cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+            if not cookies.get("acw_sc__v2"):
+                raise RuntimeError(f"cookie 没算出来，只得到 {list(cookies)}")
+            return cookies
 
-        page.route(f"{config.SSO_BASE}/__waf_probe", _fulfill)
+        def _do_post(path: str, payload: dict) -> dict:
+            """[主路径] 真实打开 sso 注册页（WAF JS 自然通过）→ 同源 fetch。"""
+            page.goto(f"{config.SSO_BASE}/register",
+                      wait_until="load", timeout=30000)
+            # 挑战页会自动 reload；cookie 出现 = 已穿透
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                if "acw_sc__v2" in {c["name"] for c in ctx.cookies()}:
+                    break
+                page.wait_for_timeout(500)
+            page.wait_for_timeout(800)      # 页面 JS 收尾
+            js = """async (args) => {
+                const r = await fetch(args.path, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    credentials: 'include',
+                    body: JSON.stringify(args.payload),
+                });
+                return {status: r.status, text: await r.text()};
+            }"""
+            return page.evaluate(js, {"path": path, "payload": payload})
 
         while True:
-            html = self._req_q.get()
-            if html is None:            # shutdown：强杀进程树，不指望优雅退出
+            item = self._req_q.get()
+            if item is None:            # shutdown：强杀进程树
                 kill_driver_tree(pw)
                 return
+            kind, data = item
             try:
-                self._current_html = html.replace(
-                    "document.location.reload()", "void 0;")
-                page.goto(f"{config.SSO_BASE}/__waf_probe",
-                          wait_until="load", timeout=20000)
-                page.wait_for_timeout(1500)     # 给混淆 JS 一点执行时间
-                cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-                if not cookies.get("acw_sc__v2"):
-                    raise RuntimeError(f"cookie 没算出来，只得到 {list(cookies)}")
-                self._resp_q.put(("ok", cookies))
-            except Exception as ex:             # noqa: BLE001 单次失败不退出循环
+                if kind == "solve":
+                    self._resp_q.put(("ok", _do_solve(data)))
+                else:
+                    path, payload = data
+                    self._resp_q.put(("ok", _do_post(path, payload)))
+            except Exception as ex:     # noqa: BLE001 单次失败不退出循环
                 self._resp_q.put(("err", str(ex)))

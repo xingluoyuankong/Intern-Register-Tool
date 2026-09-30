@@ -22,6 +22,7 @@
   本项目实测：加退避重试 + 注册并发降到 2 之后可稳定跑通。
 """
 
+import json
 import random
 import time
 from dataclasses import dataclass
@@ -40,6 +41,27 @@ class RegisterResult:
     username: str = ""
     msg_code: str = ""
     msg: str = ""
+
+
+class _WrapResponse:
+    """`WafSolver.browser_post` 结果 → 与 `requests.Response` 同形状的薄包装。
+
+    调用方（stage_register 等）只用到 `.status_code` / `.text` / `.json()`，
+    这里只实现这三个；`.headers` 给空 dict（`_is_waf_challenge` 之类不会
+    再被调到——浏览器路径成功就说明已过 WAF）。
+    """
+
+    def __init__(self, res: dict):
+        self.status_code = int(res.get("status", 0))
+        self.text = res.get("text", "")
+        self.headers: dict = {}
+
+    def json(self) -> dict:
+        return json.loads(self.text)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code}: {self.text[:120]}")
 
 
 class SSOClient:
@@ -138,10 +160,17 @@ class SSOClient:
         `if auth: h["Authorization"] = …` 分支）：它唯一的调用者是已删除的
         `internal_auth()`，删后全仓无调用者传 `auth=`（已 grep 确认）。
 
-        2026-09-30 新增：响应是 WAF 挑战页时，解出 `acw_sc__v2` 塞回 session
-        再重放（见 `_solve_waf`）。挑战重放**同样占用 attempts** —— 挑战最多
-        应该出现 1 次，连续出现说明 cookie 不被认（IP 换了 / 有效期极短），
-        此时多试也无益，如实返回最后一枪让上层归因。
+        2026-09-30 两次迭代：
+          - 挑战页出现时，**主路径改为浏览器内闭环发请求**
+            （`WafSolver.browser_post`：真实页面过 WAF 后同上下文 fetch，
+            cookie/出口/会话信誉三者一致）。纯算法 cookie（`_solve_waf`）
+            能过 WAF 但会话信誉低，网关对低分会话 429 —— 只当兜底；
+          - 走 rotating 代理（Resin）时部分出口是黑洞（POST 挂到 read
+            timeout），Timeout/ConnectionError 也纳入退避重试。
+
+        Returns:
+            requests.Response，或挑战路径下的兼容对象（`.status_code` /
+            `.text` / `.json()` 同形状）—— 调用方无感。
         """
         h = self._headers(referer)
         url = f"{self.gw}{path}"
@@ -154,7 +183,6 @@ class SSOClient:
                 # 🔴 走 rotating 代理（Resin）时部分出口节点是黑洞：
                 #    POST 挂到 read timeout。这**不是**注册失败，是链路抖动
                 #    —— requests 的连接池会换连接，重试经常就好。
-                #    2026-09-30 实测：不重试的话整批以 network 错误收场。
                 last = ex
                 if i == attempts - 1:
                     break
@@ -164,8 +192,17 @@ class SSOClient:
                 last = r
                 if i == attempts - 1:
                     break
-                self._solve_waf(r)
-                continue
+                # 主路径：真实浏览器过 WAF 后在同一上下文发请求
+                try:
+                    from .waf_bypass import WafSolver
+
+                    res = WafSolver.get().browser_post(f"{self.gw}{path}",
+                                                       payload)
+                    return _WrapResponse(res)
+                except Exception:
+                    # 兜底：算法 cookie 塞回 session 重放
+                    self._solve_waf(r)
+                    continue
             if r.status_code == 429 or r.status_code >= 500:
                 last = r
                 if i == attempts - 1:
