@@ -26,6 +26,7 @@ import atexit
 import glob
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -198,11 +199,23 @@ class WafSolver:
         #    拦，UA 覆盖+webdriver 隐藏也不够）→ 改**有头** chromium 跑在
         #    QwenPaw 自带的 Xvfb（DISPLAY=:1）上，特征与真人一致，实测穿透。
         #    完整版 chromium 随 `playwright install chromium` 一起装了。
+        # 🔴 Xvfb 会被平台间歇性杀掉：launch 失败不能崩线程 —— 置死标志，
+        #    后续请求直接 err（调用方有算法兜底，产线不中断）。
         os.environ.setdefault("DISPLAY", ":1")
-        browser = pw.chromium.launch(
-            headless=False,
-            args=["--no-sandbox", "--disable-dev-shm-usage",
-                  "--disable-blink-features=AutomationControlled"])
+        try:
+            browser = pw.chromium.launch(
+                headless=False,
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"])
+        except Exception as ex:  # noqa: BLE001
+            self._browser_dead = str(ex)[:200]
+            while True:
+                item = self._req_q.get()
+                if item is None:
+                    return
+                self._resp_q.put((
+                    "err", f"browser unavailable: {self._browser_dead}"))
+            return
 
         def _do_solve(challenge_html: str) -> dict[str, str]:
             """[兜底] 假页面执行挑战 JS，读 cookie（独立 context，用完即关）。"""
@@ -233,12 +246,29 @@ class WafSolver:
             """[主路径] 新 context（可带槽位代理）→ 真实过 WAF → 同源 fetch。"""
             kw = {}
             if proxy:
+                # 🔴 Chromium 拒绝空密码的代理 URL（ERR_INVALID_AUTH_CREDENTIALS，
+                #    2026-09-30 实测），而 Resin 网关**不校验密码**（实测任意密码
+                #    同出口）→ 空密码补占位符。
+                if ":@" in proxy:
+                    proxy = proxy.replace(":/@", ":x@")
                 kw["proxy"] = {"server": proxy}
             ctx = browser.new_context(**kw)
             page = ctx.new_page()
+            # 🔴 rotating 网关下页面完整资源加载能拖过 90s（图片/字体/统计
+            #    脚本各自都要过一次轮换隧道）。WAF 的挑战 JS 是**主文档内联
+            #    的**，穿透只需要：主文档 + 脚本 + 我们自己的 fetch。
+            #    其余资源全部 abort —— 首页秒开。
+            def _trim(route):
+                if route.request.resource_type in ("document", "script",
+                                                   "xhr", "fetch"):
+                    route.continue_()
+                else:
+                    route.abort()
+
+            page.route("**/*", _trim)
             try:
                 page.goto(f"{config.SSO_BASE}/register",
-                          wait_until="load", timeout=30000)
+                          wait_until="domcontentloaded", timeout=30000)
                 # 挑战页会自动 reload；cookie 出现 = 已穿透
                 deadline = time.time() + 25
                 while time.time() < deadline:
@@ -255,7 +285,25 @@ class WafSolver:
                     });
                     return {status: r.status, text: await r.text()};
                 }"""
-                return page.evaluate(js, {"path": path, "payload": payload})
+                args = {"path": path, "payload": payload}
+                res = page.evaluate(js, args)
+                # 🔴 实测（2026-09-30）：rotating 出口下首个 GET /register 往往
+                #    **不触发挑战**（无 acw_sc__v2），首个 fetch POST 才被 WAF
+                #    以 405 HTML 挑战（XHR 无法跳转）→ 就地把挑战页的
+                #    内联 JS 在当前页面上下文执行（写 cookie），再重放 fetch。
+                for _ in range(2):
+                    if res.get("status") != 405 or "acw_sc__v2" not in res.get(
+                            "text", ""):
+                        break
+                    m = re.search(r"<script>(.*?)</script>", res["text"], re.S)
+                    if not m:
+                        break
+                    script = m.group(1).replace(
+                        "document.location.reload()", "void 0;")
+                    page.evaluate(script)
+                    page.wait_for_timeout(300)
+                    res = page.evaluate(js, args)
+                return res
             finally:
                 try:
                     ctx.close()
