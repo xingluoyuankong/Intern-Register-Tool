@@ -44,7 +44,7 @@ def probe(slot: str, label: str) -> tuple[str, str, str]:
         "source": config.SOURCE,
         "clientId": config.CLIENT_ID,
     }
-    sso = SSOClient(proxy=slot or None)
+    sso = SSOClient(proxy=slot or None, timeout=15)
     try:
         sso.prime_session()
         r = sso._post("/register/byEmail", payload)
@@ -57,7 +57,7 @@ def probe(slot: str, label: str) -> tuple[str, str, str]:
     ip = "-"
     try:
         ip = sso.session.get("https://api.ipify.org?format=json",
-                             timeout=15).json()["ip"]
+                             timeout=10).json()["ip"]
     except Exception:  # noqa: BLE001
         pass
 
@@ -76,7 +76,11 @@ def main() -> int:
     slots = [ln.strip() for ln in SLOTS.read_text(encoding="utf-8").splitlines()
              if ln.strip() and not ln.startswith("#")]
     results = []
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    # 🔴 池子只有 10 条（随机用户名实测 ProxyError，派生不了），
+    #    所以提速只能靠压缩单轮耗时：全量并发 + 短超时。
+    #    并发 10 / 超时 15s → 一轮 ~1.5 分钟（原 4→5 分钟），
+    #    单位时间撞窗口的次数翻 3 倍 —— 命中率不变但产出速率上去了。
+    with ThreadPoolExecutor(max_workers=len(slots)) as ex:
         for v, ip, slot in ex.map(
                 lambda p: probe(p[1], p[0]), list(enumerate(slots))):
             results.append((v, ip, slot))
