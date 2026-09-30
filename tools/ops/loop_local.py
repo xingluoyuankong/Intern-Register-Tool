@@ -8,8 +8,8 @@ import sys
 import time
 from pathlib import Path
 
-LOG = Path(__file__).resolve().parents[1] / ".workbuddy-ai" / "loop_local.log"
-ROOT = Path(__file__).resolve().parents[1]
+LOG = Path(__file__).resolve().parents[2] / ".workbuddy-ai" / "loop_local.log"
+ROOT = Path(__file__).resolve().parents[2]
 
 
 def log(*a):
