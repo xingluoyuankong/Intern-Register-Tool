@@ -68,6 +68,9 @@ class SSOClient:
     def __init__(self, timeout: int = None, proxy: str = None):
         self.gw = config.SSO_GW
         self.timeout = timeout or config.REQUEST_TIMEOUT
+        # 原始代理串（requests 用 + WafSolver.browser_post 的浏览器 context
+        # 共用同一个出口 —— 两者必须同源，见 _post 挑战分支）
+        self.proxy = proxy
         self.session = requests.Session()
         # 出口代理。目标站点的封禁是 IP 维度，换 IP 靠这里。
         # `proxy` 传具体值时只作用于这个 client（槽位池并发场景必须这样用 ——
@@ -193,11 +196,12 @@ class SSOClient:
                 if i == attempts - 1:
                     break
                 # 主路径：真实浏览器过 WAF 后在同一上下文发请求
+                # （代理与 requests 同串 —— 出口一致）
                 try:
                     from .waf_bypass import WafSolver
 
-                    res = WafSolver.get().browser_post(f"{self.gw}{path}",
-                                                       payload)
+                    res = WafSolver.get().browser_post(
+                        f"{self.gw}{path}", payload, proxy=self.proxy)
                     return _WrapResponse(res)
                 except Exception:
                     # 兜底：算法 cookie 塞回 session 重放

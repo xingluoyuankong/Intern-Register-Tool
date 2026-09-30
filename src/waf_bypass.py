@@ -150,13 +150,17 @@ class WafSolver:
         self._req_q.put(("solve", challenge_html))
         return self._wait()
 
-    def browser_post(self, path: str, payload: dict) -> dict:
+    def browser_post(self, path: str, payload: dict,
+                     proxy: str = None) -> dict:
         """[主路径] 真实浏览器过 WAF 后，在同一上下文 fetch 注册接口。
 
+        `proxy`：Resin 槽位串（`http://user:@host:port`）—— 每次调用
+        **新建 context**（cookie 隔离 + 指定出口），用完即关。与 requests
+        的 SSOClient 传同一串，保证两条链路同出口。
         返回 `{"status": int, "text": str}`。阻塞至多 `WAF_SOLVE_TIMEOUT` 秒。
         """
         self._ensure_started()
-        self._req_q.put(("post", (path, payload)))
+        self._req_q.put(("post", (path, payload, proxy)))
         return self._wait()
 
     def shutdown(self):
@@ -189,49 +193,74 @@ class WafSolver:
 
         pw = sync_playwright().start()
         atexit.register(kill_driver_tree, pw)
+        # 🔴 headless 特征（UA HeadlessChrome / navigator.webdriver）会被
+        #    WAF 二层级识别并 405（2026-09-30 实测：首页 JS 能过、fetch 被
+        #    拦，UA 覆盖+webdriver 隐藏也不够）→ 改**有头** chromium 跑在
+        #    QwenPaw 自带的 Xvfb（DISPLAY=:1）上，特征与真人一致，实测穿透。
+        #    完整版 chromium 随 `playwright install chromium` 一起装了。
+        os.environ.setdefault("DISPLAY", ":1")
         browser = pw.chromium.launch(
-            executable_path=find_headless_browser(), headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"])
-        ctx = browser.new_context()
-        page = ctx.new_page()
+            headless=False,
+            args=["--no-sandbox", "--disable-dev-shm-usage",
+                  "--disable-blink-features=AutomationControlled"])
 
         def _do_solve(challenge_html: str) -> dict[str, str]:
-            """[兜底] 假页面执行挑战 JS，读 cookie。"""
-            html = challenge_html.replace(
-                "document.location.reload()", "void 0;")
-            page.route(f"{config.SSO_BASE}/__waf_probe", lambda route: (
-                route.fulfill(status=200,
-                              content_type="text/html; charset=utf-8",
-                              body=html)))
-            page.goto(f"{config.SSO_BASE}/__waf_probe",
-                      wait_until="load", timeout=20000)
-            page.wait_for_timeout(1500)     # 给混淆 JS 一点执行时间
-            cookies = {c["name"]: c["value"] for c in ctx.cookies()}
-            if not cookies.get("acw_sc__v2"):
-                raise RuntimeError(f"cookie 没算出来，只得到 {list(cookies)}")
-            return cookies
+            """[兜底] 假页面执行挑战 JS，读 cookie（独立 context，用完即关）。"""
+            ctx = browser.new_context()
+            page = ctx.new_page()
+            try:
+                html = challenge_html.replace(
+                    "document.location.reload()", "void 0;")
+                page.route(f"{config.SSO_BASE}/__waf_probe", lambda route: (
+                    route.fulfill(status=200,
+                                  content_type="text/html; charset=utf-8",
+                                  body=html)))
+                page.goto(f"{config.SSO_BASE}/__waf_probe",
+                          wait_until="load", timeout=20000)
+                page.wait_for_timeout(1500)     # 给混淆 JS 一点执行时间
+                cookies = {c["name"]: c["value"] for c in ctx.cookies()}
+                if not cookies.get("acw_sc__v2"):
+                    raise RuntimeError(
+                        f"cookie 没算出来，只得到 {list(cookies)}")
+                return cookies
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
 
-        def _do_post(path: str, payload: dict) -> dict:
-            """[主路径] 真实打开 sso 注册页（WAF JS 自然通过）→ 同源 fetch。"""
-            page.goto(f"{config.SSO_BASE}/register",
-                      wait_until="load", timeout=30000)
-            # 挑战页会自动 reload；cookie 出现 = 已穿透
-            deadline = time.time() + 25
-            while time.time() < deadline:
-                if "acw_sc__v2" in {c["name"] for c in ctx.cookies()}:
-                    break
-                page.wait_for_timeout(500)
-            page.wait_for_timeout(800)      # 页面 JS 收尾
-            js = """async (args) => {
-                const r = await fetch(args.path, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    credentials: 'include',
-                    body: JSON.stringify(args.payload),
-                });
-                return {status: r.status, text: await r.text()};
-            }"""
-            return page.evaluate(js, {"path": path, "payload": payload})
+        def _do_post(path: str, payload: dict, proxy: str | None) -> dict:
+            """[主路径] 新 context（可带槽位代理）→ 真实过 WAF → 同源 fetch。"""
+            kw = {}
+            if proxy:
+                kw["proxy"] = {"server": proxy}
+            ctx = browser.new_context(**kw)
+            page = ctx.new_page()
+            try:
+                page.goto(f"{config.SSO_BASE}/register",
+                          wait_until="load", timeout=30000)
+                # 挑战页会自动 reload；cookie 出现 = 已穿透
+                deadline = time.time() + 25
+                while time.time() < deadline:
+                    if "acw_sc__v2" in {c["name"] for c in ctx.cookies()}:
+                        break
+                    page.wait_for_timeout(500)
+                page.wait_for_timeout(800)      # 页面 JS 收尾
+                js = """async (args) => {
+                    const r = await fetch(args.path, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        credentials: 'include',
+                        body: JSON.stringify(args.payload),
+                    });
+                    return {status: r.status, text: await r.text()};
+                }"""
+                return page.evaluate(js, {"path": path, "payload": payload})
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
 
         while True:
             item = self._req_q.get()
@@ -243,7 +272,7 @@ class WafSolver:
                 if kind == "solve":
                     self._resp_q.put(("ok", _do_solve(data)))
                 else:
-                    path, payload = data
-                    self._resp_q.put(("ok", _do_post(path, payload)))
+                    path, payload, proxy = data
+                    self._resp_q.put(("ok", _do_post(path, payload, proxy)))
             except Exception as ex:     # noqa: BLE001 单次失败不退出循环
                 self._resp_q.put(("err", str(ex)))
