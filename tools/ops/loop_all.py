@@ -175,11 +175,13 @@ def local_round():
     log(f"[loc] screen -> {n} usable")
     if n < 1:
         return
-    count = min(n * 2, 6)
-    workers = min(n, 3)
+    count = min(n * 2, 4)
+    workers = min(workers, n)
     log(f"[loc] run --count {count} --workers {workers}")
+    # 🔴 登录建 key 是浏览器 + 验证码，单号 60~120s，批量号数要留足时间：
+    #    4 号实测要 14min+（count=4/timeout=900 被截断过一次）。
     out = sh([sys.executable, "-u", "run.py", "--count", str(count),
-              "--workers", str(workers)], timeout=830)
+              "--workers", str(workers)], timeout=1500)
     ok = 0
     for ln in out.splitlines():
         if "API KEY" in ln:
