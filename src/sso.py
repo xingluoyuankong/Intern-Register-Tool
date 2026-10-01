@@ -222,8 +222,12 @@ class SSOClient:
                 try:
                     self._solve_waf(r, method=method)
                 except Exception:
-                    pass       # 解法本身失败 → 换下一种，不中断重试链
+                    pass       # 解法本身失败 → 换下一种,不中断重试链
                 continue
+            # 🔴 405 = WAF 判这个出口高风险，**不要重试**（重试只会烧同一出口的信誉）
+            if r.status_code == 405:
+                last = r
+                break
             if r.status_code == 429 or r.status_code >= 500:
                 last = r
                 if i == attempts - 1:

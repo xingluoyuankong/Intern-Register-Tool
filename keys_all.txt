@@ -1,0 +1,73 @@
+共 19 个 key（09-30 21:33 汇总）
+
+【OpenXLab / 书生 控制台】
+- 账号登录:        https://sso.openxlab.org.cn
+- API Key 管理页:  https://openxlab.org.cn/gpt/user-center  (登录后「API密钥」)
+- 书生·浦语对话:   https://chat.intern-ai.org.cn
+
+【API 调用端点（本项目实测可用）】
+- Chat (OpenAI 兼容): https://discovery-api.intern-ai.org.cn/v1/chat/completions
+- 模型列表:           https://discovery.intern-ai.org.cn
+- 可用模型:           intern-s2 等 (intern-s1 不在免费列表, model_not_available)
+- 认证头:             Authorization: Bearer <API_KEY>
+
+【服务器台账】ssh qwenpaw-tom → /root/intern-register/ledger/
+【本机台账】    E:/API获取工具/Intern-Register/ledger/
+
+01  sk-c3f263e970371c600d46933e4c56b14baf8058b4c74c1f70e4c358eb5f185a14
+    email: hesterdenton55+2xca0wx8n8@outlook.com
+    uid:   862500585
+02  sk-7bf7c2f3e90370fdb1c6f8e145321776e3e63720e513364e601fb1daffc73562
+    email: skytuel4608+dvd9y7chg9@outlook.com
+    uid:   200200294
+03  sk-044bcca327ed13836730dec88bbcb6e2b4d5c90ad12ae7d23a3af0591d228662
+    email: lauraeuler4614+ujq2a925xc@outlook.com
+    uid:   184800783
+04  sk-9270abc610094b95c9c0f225d08b0b2eaf066f78ad3b43f716915fc771de7181
+    email: porschestefanow68+djj57x2lpu@outlook.com
+    uid:   
+05  sk-e83472b943aa51b6c39bafa37082b5061d5a7b48e9c21acf0e066fbf079e35cf
+    email: aidanmacqueen42+49evavj5fw@outlook.com
+    uid:   
+06  sk-fa1abe639fa4553ed48fd73f5cc7ce9d1c0643f90ec7bfdcfc4c9d86d191ff47
+    email: hesterdenton55+ehevnx0cki@outlook.com
+    uid:   
+07  sk-b48f646a2be6023ee5a12530645d171f7ad11a5dfa10efb78ec3d7d29308c76c
+    email: hesterdenton55+wlf2wgplbz@outlook.com
+    uid:   
+08  sk-4d7d00f61bff6338f451e66627c01d83bd1332b80b05d040b8ce28f58224bdb7
+    email: karenaboike819+d9s2neev8a@outlook.com
+    uid:   
+09  sk-dc1c908cfe97354c8b410d5fbc807b51775ef5939bad70eb0dfd8a2dd570c1ea
+    email: eudorasnorden223+vty60qik12@outlook.com
+    uid:   
+10  sk-94713e37d5300b44a49c084c48d32762aa93e04008edc149004a3cd89ede6300
+    email: divinazerr1067+w6d1th2j4d@outlook.com
+    uid:   
+11  sk-b793362b69b3aab5c199822faaccd86d028a56b94af9d966b10759801311dcb4
+    email: porschestefanow68+7r33rh4wdy@outlook.com
+    uid:   
+12  sk-082c63fcab19090f86c2060b6187d6e66f48886191db266a662c3abd155df254
+    email: nevilschucker6337+uvercrz3gt@outlook.com
+    uid:   
+13  sk-1a4d90fc12a89fefb6f621eb1fe9bbb825dc7c1400f306d0687d9ae0addc4269
+    email: nevilschucker6337+7yp38a6xyz@outlook.com
+    uid:   820400573
+14  sk-79697d26fd32b2000514495be91b2095c7cfa388c639826a3d8cf2d047dbcded
+    email: lesahaer7714+p4ii1g4uhn@outlook.com
+    uid:   417700063
+15  sk-3592037ee9bbf57590f2a3b019c142de2e6e478c2e65b605949b40a64d224ad8
+    email: hesterdenton55+z5l06nlnwg@outlook.com
+    uid:   820400983
+16  sk-462a41b01549f87abadaeff63a261521357f81a6588508c2bb2b138075392e15
+    email: porschestefanow68+zryhfl5xoo@outlook.com
+    uid:   892600544
+17  sk-3036db049ef80224a4fc1ac6fc793819e6d3042bcb6a9dee4c93e6b4ee74d0a3
+    email: lauraeuler4614+4tz2n2j8et@outlook.com
+    uid:   360000311
+18  sk-be7028bec8883d54ec1f4d4fc119ac2a91df22a2bec9ccd4316e472bbb7f2275
+    email: nevilschucker6337+jug13hvmaf@outlook.com
+    uid:   184800979
+19  sk-8f840d555993da386d3a87b8ce70ab36703d07e19aa77448e1c089bcbc76884b
+    email: lesahaer7714+vkeuy33hax@outlook.com
+    uid:   892600216

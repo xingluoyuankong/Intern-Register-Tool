@@ -80,6 +80,9 @@ def probe(slot: str, label: str) -> tuple[str, str, str]:
         return "CHAL", ip, slot
     if r.status_code in (200, 429):
         return "CLEAR", ip, slot
+    # 🔴 405 = WAF 判这个出口高风险 → DEAD（不要当 CLEAR 让注册去撞）
+    if r.status_code == 405:
+        return "DEAD:HTTP405", ip, slot
     return f"HTTP{r.status_code}", ip, slot
 
 
