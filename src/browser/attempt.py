@@ -246,6 +246,18 @@ def _playwright_proxy(slot: str) -> dict:
     return d
 
 
+# 走代理时掐掉的非必要资源类型（见 _run_attempt 的说明）
+_HEAVY = ("image", "font", "media")
+
+
+def _block_heavy_resources(route):
+    """掐掉图片/字体/媒体，只放行 HTML/JS/CSS/XHR。"""
+    if route.request.resource_type in _HEAVY:
+        route.abort()
+    else:
+        route.continue_()
+
+
 def _run_attempt(browser, *, account: str, password: str, headless: bool,
                  timeout: int, screenshot_prefix: str = None,
                  verbose: bool = False, tag: str = "",
@@ -288,6 +300,10 @@ def _run_attempt(browser, *, account: str, password: str, headless: bool,
     ctx = browser.new_context(**ctx_kwargs)
     ctx.add_init_script(ANTI_DETECT_JS)
     page = ctx.new_page()
+    # 🔴 走代理时页面的图片/字体/媒体是纯负担：既拖慢加载（实测 goto 120s
+    #    都超时），又放大被 WAF 拦的概率（请求数越多越像爬虫）。
+    #    登录只依赖 HTML + JS（验证码脚本），其余一律掐掉。
+    page.route("**/*", _block_heavy_resources)
     page.on("response", st.on_response)
 
     try:
