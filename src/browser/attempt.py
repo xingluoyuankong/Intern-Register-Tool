@@ -229,6 +229,23 @@ def _build_result(st: _AttemptState, *, cookies: dict, waited: int) -> LoginResu
 # ────────────────────────────────────────────────────────────────
 # 在给定 browser 上跑一次尝试（自带 context 生命周期）
 # ────────────────────────────────────────────────────────────────
+def _playwright_proxy(slot: str) -> dict:
+    """把 `http://user:pass@host:port` 拆成 Playwright 需要的字段。
+
+    Playwright/Chrome 不会解析 server URL 里的 user:pass，必须分开传，
+    否则代理认证静默失效（页面加载不动 → 超时）。
+    """
+    from urllib.parse import unquote, urlparse
+
+    u = urlparse(slot)
+    d = {"server": f"{u.scheme or 'http'}://{u.hostname}:{u.port or 80}"}
+    if u.username:
+        d["username"] = unquote(u.username)
+    if u.password:
+        d["password"] = unquote(u.password)
+    return d
+
+
 def _run_attempt(browser, *, account: str, password: str, headless: bool,
                  timeout: int, screenshot_prefix: str = None,
                  verbose: bool = False, tag: str = "",
@@ -252,7 +269,11 @@ def _run_attempt(browser, *, account: str, password: str, headless: bool,
         color_scheme="light",
     )
     if proxy:
-        ctx_kwargs["proxy"] = {"server": proxy}
+        # 🔴 Playwright 的 proxy 必须把认证拆成独立字段，**不能**把
+        #    `user:pass@` 塞进 server URL —— 塞进去 Chrome 会静默忽略认证，
+        #    表现为页面一直加载不动直到超时（2026-10-01 实测：走代理登录
+        #    Page.goto 120s 超时，就是这个原因）。
+        ctx_kwargs["proxy"] = _playwright_proxy(proxy)
     if headless:
         # 唯一的 UA 覆盖：去掉 HeadlessChrome 自我标记，版本号原样保留。
         # Chrome 的 reduced UA 只用主版本号（Chrome/152.0.0.0），
