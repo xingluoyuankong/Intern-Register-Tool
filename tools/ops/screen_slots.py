@@ -49,14 +49,24 @@ def probe(slot: str, label: str) -> tuple[str, str, str]:
         "source": config.SOURCE,
         "clientId": config.CLIENT_ID,
     }
-    sso = SSOClient(proxy=slot or None, timeout=15)
-    try:
-        sso.prime_session()
-        r = sso._post("/register/byEmail", payload)
-    except requests.RequestException as ex:
-        return f"DEAD:{type(ex).__name__}", "-", slot
-    except Exception as ex:  # noqa: BLE001
-        return f"ERR:{type(ex).__name__}", "-", slot
+    # 🔴 Resin 出口是**轮询**不是固定绑定：一次连接失败 ≠ 槽位死，
+    #    可能只是轮到了被标记的出口。失败就**新会话重试**（最多 2 次），
+    #    每次会话独立 → 出口重新轮询，命中好出口就过了。
+    last_exc = None
+    for _attempt in range(2):
+        sso = SSOClient(proxy=slot or None, timeout=15)
+        try:
+            sso.prime_session()
+            r = sso._post("/register/byEmail", payload)
+            break
+        except requests.RequestException as ex:
+            last_exc = ex
+            time.sleep(1)
+        except Exception as ex:  # noqa: BLE001
+            last_exc = ex
+            time.sleep(1)
+    else:
+        return f"DEAD:{type(last_exc).__name__}x3", "-", slot
 
     # 取出口 IP（POST 之后，同一 session 语义）
     ip = "-"
@@ -81,26 +91,34 @@ def main() -> int:
     slots = [ln.strip() for ln in SLOTS.read_text(encoding="utf-8").splitlines()
              if ln.strip() and not ln.startswith("#")]
     results = []
-    # 🔴 池子只有 10 条（随机用户名实测 ProxyError，派生不了），
-    #    所以提速只能靠压缩单轮耗时：全量并发 + 短超时。
-    #    并发 10 / 超时 15s → 一轮 ~1.5 分钟（原 4→5 分钟），
-    #    单位时间撞窗口的次数翻 3 倍 —— 命中率不变但产出速率上去了。
-    with ThreadPoolExecutor(max_workers=len(slots)) as ex:
+    # 🔴 并发必须限流：池子从 10 扩到 50 后，全量并发会把 Resin 网关打爆
+    #    → 大量 ProxyError 被误判成 DEAD（实测 50 并发只剩 1 个 CLEAR，
+    #      限到 8 并发后同一批槽位状态正常）。宁可多花点时间分批筛。
+    workers = min(len(slots), 12)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         for v, ip, slot in ex.map(
                 lambda p: probe(p[1], p[0]), list(enumerate(slots))):
             results.append((v, ip, slot))
             print(f"{v:<22} {ip:<16} {user_of(slot)[:18]}", flush=True)
 
     good = [(ip, slot) for v, ip, slot in results if v == "CLEAR" and ip != "-"]
-    ACTIVE.write_text("\n".join(s for _, s in good) + "\n", encoding="utf-8")
-    mapping = ",".join(f"{user_of(s)}={ip}" for ip, s in good)
+    # 🔴 **按出口 IP 去重**：Resin 网关会给不同订阅链接分配同一个出口 IP，
+    #    不去重的话注册时连续几单其实是同一个 IP 在打 → 同 IP 高频被 WAF
+    #    按批量拦（用户 10-01 点名的问题）。每个 IP 只留一条槽位。
+    seen_ip: dict[str, str] = {}
+    for ip, slot in good:
+        seen_ip.setdefault(ip, slot)
+    dedup = sorted(seen_ip.items())
+    ACTIVE.write_text("\n".join(s for _, s in dedup) + "\n", encoding="utf-8")
+    mapping = ",".join(f"{user_of(s)}={ip}" for ip, s in dedup)
     lines = [(f"IR_SLOT_EGRESS_IPS={mapping}"
               if ln.startswith("IR_SLOT_EGRESS_IPS") else ln)
              for ln in ENV.read_text(encoding="utf-8").splitlines()]
     ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"\nusable(POST-CLEAR) {len(good)}/{len(slots)} -> slots_active.txt",
+    print(f"\nusable(POST-CLEAR) {len(good)}/{len(slots)}"
+          f" | 去重后 {len(dedup)} 个不同出口 IP -> slots_active.txt",
           flush=True)
-    return len(good)
+    return len(dedup)
 
 
 if __name__ == "__main__":
