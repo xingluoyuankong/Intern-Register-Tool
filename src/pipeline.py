@@ -619,6 +619,10 @@ def stage_login_key(rec: AccountRecord, *, session=None, headless: bool = True,
             res = browser_login(rec.email, rec.password, headless=headless,
                                 screenshot_prefix=screenshot_prefix,
                                 verbose=verbose,
+                                # 🔴 只试 1 次：走代理时登录页加载不动是常态，
+                                #    原地重试 3 次 = 白烧 15 分钟。换号换槽位
+                                #    才能撞上能加载的出口（吞吐 ×3）。
+                                attempts=1,
                                 # 🔴 登录浏览器**默认不走代理**（2026-10-01 实测）：走 Resin 时
                                 #    Page.goto 120s 都超时（页面资源加载不动），而
                                 #    requests 走同一代理注册是通的。直连登录本来就能
