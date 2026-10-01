@@ -83,6 +83,13 @@ QUOTA_MSG_CODE = "B0000"
 # 代价只有一次请求；而误停的代价是整批账号被跳过。
 QUOTA_STREAK_STOP = 2
 
+# 一个账号最多换几个**不同出口**再认输（槽位池模式下）。
+# 🔴 依据：Resin 是轮询出口，screen 的 CLEAR 只对筛选那一刻成立 ——
+#    注册那一刻同链接可能已轮到被标记的出口。实测池里同时只有约 1/3
+#    的出口真能注册 ⇒ 换 3 次把单次命中率 p 抬到 1-(1-p)^3。
+#    换出口的代价是几秒（放弃解题 + 短冷却），远比"废掉这个号"划算。
+SLOT_RETRY = 3
+
 
 # ── 错误分类（`AccountRecord.error_kind`）────────────────────────────
 #
@@ -926,55 +933,83 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
         ok = False
         lease = None
         scope = ""
+        tried: set = set()
+        # 🔴 一个号最多换 **3 个**不同出口再认输（2026-10-01 实测）。
+        #    为什么必须换：screen 只在**筛选那一刻**保证出口 CLEAR，而 Resin
+        #    是轮询出口 —— 注册那一刻这个链接可能已经轮到被 WAF 标记的出口了
+        #    （实测 13 条池里同时只有 ~5 条真能注册）。撞挑战就废掉这个号，
+        #    命中率只有单次成功率；换出口后命中率 ≈ 1-(1-p)^3。
+        #    非池模式（无 pool）没有"另一个出口"可换，退化为单次。
+        tries = SLOT_RETRY if pool is not None else 1
         try:
-            if pool is not None:
-                # 独占一个出口 IP。全池都在冷却时阻塞等待，超时抛 TimeoutError。
-                #
-                # 🔴 `accept=gov.check_slot` 把"出口配额已满"的槽位**提前排除在
-                #    候选之外**（判据在 `QuotaGovernor.check_slot`，理由也写在那里）。
-                try:
-                    lease = pool.acquire(timeout=config.IR_PROXY_SLOT_TIMEOUT,
-                                         accept=gov.check_slot)
-                except NoEligibleSlot as ex:
-                    # 有空闲槽位，但它们的出口配额全满了。
-                    # 配额要几小时才滑出窗口 ⇒ 等下去毫无意义，直接记"跳过"。
-                    rec.status = "skipped"
-                    rec.error = (f"quota guard: 所有出口配额均已满"
-                                 f"（{ex}），未发请求")
-                    rec.error_kind = ERR_QUOTA_GUARD
-                    log(f"跳过（所有出口配额已满：{ex}）")
-                    return
-                except TimeoutError as ex:
-                    # 等不到槽位 ≠ 这个账号注册失败，但也绝不能假装成功。
-                    rec.status = "failed"
-                    rec.error = f"register: {ex}"
-                    rec.error_kind = ERR_NETWORK
-                    log(f"⏳ 等不到空闲槽位（{pool.describe()}）")
-                    return
-                # 🔴 scope 取**出口 IP**，不是槽位位置号 —— 位置号会随
-                #    `slots.txt` 增删条目整体错位，把配额记到别的 IP 头上
-                #    （本项目实测已发生过，见 config.SLOT_EGRESS_IPS 的说明）。
-                scope = config.slot_scope(lease.url)
-                rec.proxy_slot = lease.url      # 🔴 必须是**槽位串**
-                log(f"出口槽位 {lease}（配额记在 {scope} 名下）")
-                # 这个出口自己的配额（不是全局的 —— 见 quota.status 的说明）。
-                # 复查的判据在 `QuotaGovernor.claim_slot`（理由也写在那里）。
-                why = gov.claim_slot(scope, log)
-                if why:
-                    rec.status = "skipped"
-                    rec.error = why
-                    rec.error_kind = ERR_QUOTA_GUARD
-                    return
-            mail = build_mail_client()
-            # 🔴 proxy 必须传**具体值**给这个 client，不能改全局 `IR_PROXY` ——
-            #    多个 producer 同时改全局会互相踩（见 config.apply_proxy）。
-            sso = SSOClient(proxy=(lease.url if lease else None))
-            # 种会话链（GET 注册页）：跳过它裸 POST 的挑战重放会被持续
-            # 挑战 —— 见 sso.prime_session 的终局实测注释。
-            sso.prime_session()
-            ok = stage_register(mail, sso, rec, mail_domain=mail_domain, log=log,
-                                gate=reg_gate, should_stop=gov.hit,
-                                quota_scope=scope)
+            for _attempt in range(tries):
+                if pool is not None:
+                    # 上一轮失败 → 归还旧租约再换一个（exclude 保证不拿同一个）
+                    if lease is not None:
+                        pool.report_failed(lease, "换出口重试", cooldown=5.0)
+                        lease = None
+                    # 独占一个出口 IP。全池都在冷却时阻塞等待，超时抛 TimeoutError。
+                    #
+                    # 🔴 `accept=gov.check_slot` 把"出口配额已满"的槽位**提前排除在
+                    #    候选之外**（判据在 `QuotaGovernor.check_slot`，理由也写在那里）。
+                    try:
+                        lease = pool.acquire(
+                            timeout=config.IR_PROXY_SLOT_TIMEOUT,
+                            accept=gov.check_slot, exclude=tried)
+                    except NoEligibleSlot as ex:
+                        # 有空闲槽位，但它们的出口配额全满了。
+                        # 配额要几小时才滑出窗口 ⇒ 等下去毫无意义，直接记"跳过"。
+                        rec.status = "skipped"
+                        rec.error = (f"quota guard: 所有出口配额均已满"
+                                     f"（{ex}），未发请求")
+                        rec.error_kind = ERR_QUOTA_GUARD
+                        log(f"跳过（所有出口配额已满：{ex}）")
+                        return
+                    except TimeoutError as ex:
+                        # 等不到槽位 ≠ 这个账号注册失败，但也绝不能假装成功。
+                        rec.status = "failed"
+                        rec.error = f"register: {ex}"
+                        rec.error_kind = ERR_NETWORK
+                        log(f"⏳ 等不到空闲槽位（{pool.describe()}）")
+                        return
+                    tried.add(lease.slot)
+                    # 🔴 scope 取**出口 IP**，不是槽位位置号 —— 位置号会随
+                    #    `slots.txt` 增删条目整体错位，把配额记到别的 IP 头上
+                    #    （本项目实测已发生过，见 config.SLOT_EGRESS_IPS 的说明）。
+                    scope = config.slot_scope(lease.url)
+                    rec.proxy_slot = lease.url      # 🔴 必须是**槽位串**
+                    log(f"出口槽位 {lease}（配额记在 {scope} 名下）"
+                        + (f" [第 {_attempt + 1}/{tries} 次]" if tries > 1 else ""))
+                    # 这个出口自己的配额（不是全局的 —— 见 quota.status 的说明）。
+                    # 复查的判据在 `QuotaGovernor.claim_slot`（理由也写在那里）。
+                    why = gov.claim_slot(scope, log)
+                    if why:
+                        # 这个出口满了 —— 换下一个，不是整号失败。
+                        rec.error = why
+                        log(f"  出口配额已满，换下一个（{why}）")
+                        continue
+                mail = build_mail_client()
+                # 🔴 proxy 必须传**具体值**给这个 client，不能改全局 `IR_PROXY` ——
+                #    多个 producer 同时改全局会互相踩（见 config.apply_proxy）。
+                sso = SSOClient(proxy=(lease.url if lease else None))
+                # 🔴 池化模式下：撞挑战页**立刻放弃、换出口**，不要原地解题。
+                #    理由（2026-10-01 实测卡死复盘）：browser 兜底单次 90s ×
+                #    4 次尝试 = 一个号最长卡 6 分钟零输出。而池子里本来就有
+                #    screen 筛过的 CLEAR 出口 —— 换出口比解题快几个数量级。
+                #    非池模式（单代理/直连）没有"换出口"这条路，保持解题。
+                if lease is not None:
+                    sso.abandon_on_challenge = True
+                # 种会话链（GET 注册页）：跳过它裸 POST 的挑战重放会被持续
+                # 挑战 —— 见 sso.prime_session 的终局实测注释。
+                sso.prime_session()
+                ok = stage_register(mail, sso, rec, mail_domain=mail_domain,
+                                    log=log, gate=reg_gate, should_stop=gov.hit,
+                                    quota_scope=scope)
+                if ok:
+                    break
+                # 业务层明确拒绝（用户名重复等）→ 换出口也没用，别浪费邮箱
+                if rec.error_kind in (ERR_REJECTED, ERR_QUOTA_GUARD):
+                    break
         except Exception as ex:
             rec.status = "failed"
             rec.error = f"register: {ex}"

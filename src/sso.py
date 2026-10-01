@@ -33,6 +33,15 @@ from . import config
 from .crypto_rsa import encrypt_password
 
 
+class WafChallengeError(RuntimeError):
+    """撞上 WAF 挑战页，且调用方选择**放弃解题**（`abandon_on_challenge`）。
+
+    刻意不用 `requests` 的异常类型：它表达的是"这个出口现在过不去"，
+    不是"网络故障"。调用方（pipeline）按 network 失败处理 →
+    `report_failed`（短冷却）→ 下一个号换出口。
+    """
+
+
 @dataclass
 class RegisterResult:
     ok: bool
@@ -87,6 +96,10 @@ class SSOClient:
             "Origin": config.SSO_BASE,
             "User-Agent": config.USER_AGENT,
         })
+        # 🔴 撞挑战页时**放弃解题、换出口**（见 _post 的 abandon_on_challenge）。
+        #    默认 False —— 筛槽位（screen_slots）要靠挑战页判出口好坏，
+        #    不能放弃；只有注册产线（pipeline 拿到槽位租约后）会打开它。
+        self.abandon_on_challenge = False
 
     def _headers(self, referer_path: str = "/register") -> dict:
         h = dict(self.session.headers)
@@ -170,8 +183,20 @@ class SSOClient:
             domain="sso.openxlab.org.cn", path="/")
 
     def _post(self, path: str, payload: dict, *, referer: str = "/register",
-              attempts: int = 4) -> requests.Response:
+              attempts: int = 4,
+              abandon_on_challenge: bool = False) -> requests.Response:
         """带退避重试的 POST。
+
+        🔴 `abandon_on_challenge=True`：遇到挑战页**立刻放弃**（抛
+        `WafChallengeError`），不走 js/browser/algo 轮换解题。
+
+        为什么要有这个开关（2026-10-01 实测，用户点名"注册脚本卡死"）：
+            WAF_SOLVE_TIMEOUT=90s，browser 兜底单次最多 90s；_post 最多
+            4 次尝试 → 一个号最长卡 **6 分钟零输出**，整批看起来像死了。
+        但**池化模式下换出口比解题快得多**：池子里本来就有真能注册的
+            CLEAR 出口（screen 筛过），ChallENGING 只说明"这个出口现在不行"。
+        所以注册产线走 abandon：几秒放弃 → report_failed → 换下一个出口。
+        筛槽位（screen_slots）仍走解题路径 —— 它要靠挑战页判出口好坏。
 
         🔴 为什么必须有：`register/byEmail` 有写操作限流。实测 4 路并发注册时
         3 路立刻拿到 `429 Too Many Requests`（~1.2s 就返回，不是超时）。
@@ -214,6 +239,10 @@ class SSOClient:
                 time.sleep(min(1.5 * (2 ** i), 8.0) + random.uniform(0, 1))
                 continue
             if self._is_waf_challenge(r):
+                # 🔴 池化产线：放弃解题，换出口（见 abandon_on_challenge 的说明）
+                if abandon_on_challenge:
+                    raise WafChallengeError(
+                        f"WAF 挑战页，放弃本出口（{r.status_code}）")
                 last = r
                 if used >= len(solvers):
                     break
@@ -278,7 +307,8 @@ class SSOClient:
             "source": config.SOURCE,
             "clientId": config.CLIENT_ID,
         }
-        r = self._post("/register/byEmail", payload)
+        r = self._post("/register/byEmail", payload,
+                       abandon_on_challenge=self.abandon_on_challenge)
         body = r.json()
         data = body.get("data") or {}
         return RegisterResult(

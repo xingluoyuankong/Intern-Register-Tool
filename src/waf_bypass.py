@@ -39,7 +39,8 @@ def find_headless_browser() -> str:
     """headless 用 playwright 自带 chromium（系统 Chrome 的 close 会挂死）。
 
     顺序：`IR_WAF_BROWSER_PATH` → playwright 缓存里**最新**的
-    chromium_headless_shell → 回退 `config.CHROME_PATH`。
+    chromium_headless_shell → playwright 配套 chromium **完整版**
+    → 回退 `config.CHROME_PATH`（**下策**，见文末警告）。
     三平台缓存布局（playwright ≥1.49，headless shell 独立成包后
     各平台目录名统一为 chrome-headless-shell-<os><arch>）：
       Windows  ~/AppData/Local/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-win64/chrome-headless-shell.exe
@@ -50,28 +51,52 @@ def find_headless_browser() -> str:
     if env and os.path.isfile(env):
         return env
     home = os.path.expanduser("~")
-    roots = [
+    roots: list[str] = []
+    # 🔴 `PLAYWRIGHT_BROWSERS_PATH` 常被指到**非 home** 目录（本机是
+    #    `F:\Playwright\ms-playwright`）。原来只搜 home 下三个默认位置，
+    #    于是这个盘里的浏览器**一个都看不见** → 静默回退系统 Chrome → 挂死。
+    pb = os.getenv("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    if pb:
+        roots.append(pb)
+    roots += [
         os.path.join(home, "AppData", "Local", "ms-playwright"),
         os.path.join(home, ".cache", "ms-playwright"),
         os.path.join(home, "Library", "Caches", "ms-playwright"),
     ]
-    cands: list[str] = []
+    shell: list[str] = []    # 纯 headless shell（最优）
+    full: list[str] = []     # playwright 配套**完整版** chromium（次优）
     for root in roots:
-        cands += glob.glob(os.path.join(
+        shell += glob.glob(os.path.join(
             root, "chromium_headless_shell-*", "*", "chrome-headless-shell.exe"))
-        cands += glob.glob(os.path.join(
+        shell += glob.glob(os.path.join(
             root, "chromium_headless_shell-*", "chrome-headless-shell-*",
             "chrome-headless-shell"))
-        cands += glob.glob(os.path.join(
+        shell += glob.glob(os.path.join(
             root, "chromium_headless_shell-*", "chrome-headless-shell-*",
             "chrome-headless-shell.exe"))
-        cands += glob.glob(os.path.join(
+        shell += glob.glob(os.path.join(
             root, "chromium_headless_shell-*", "chrome-linux*", "headless_shell"))
-        cands += glob.glob(os.path.join(
+        shell += glob.glob(os.path.join(
             root, "chromium_headless_shell-*", "chrome-mac*", "headless_shell"))
-    if cands:
+        # 🔴 第二优先级：只装了 `chromium-<build>`（完整版，没单独下
+        #    headless shell 包）时的兜底。它是 **playwright 配套的**，
+        #    launch/close 都正常；真正会挂死的是最后那个**系统 Chrome**。
+        full += glob.glob(os.path.join(
+            root, "chromium-*", "chrome-win64", "chrome.exe"))
+        full += glob.glob(os.path.join(
+            root, "chromium-*", "chrome-win", "chrome.exe"))
+        full += glob.glob(os.path.join(
+            root, "chromium-*", "chrome-linux*", "chrome"))
+        full += glob.glob(os.path.join(
+            root, "chromium-*", "chrome-mac*", "Chromium.app",
+            "Contents", "MacOS", "Chromium"))
+    if shell:
         # 版本号排序取最新（目录名 chromium_headless_shell-<build>）
-        return sorted(cands)[-1]
+        return sorted(shell)[-1]
+    if full:
+        return sorted(full)[-1]
+    # ⚠ 到这一步只剩系统 Chrome —— 它被 playwright 驱动时 close() 挂死
+    #   （2026-09-30 实测，曾让 run.py 卡 5 分钟）。能不走到这里就别走。
     return config.CHROME_PATH
 
 
