@@ -12,6 +12,7 @@ import time
 from .. import config
 from .attempt import _run_attempt
 from .constants import CHROME_ARGS
+from .launch import current_engine, launch_browser
 from .state import LoginResult
 
 
@@ -50,17 +51,39 @@ def _launch_kwargs(headless: bool, chrome_args=None) -> dict:
         exe = find_headless_browser()
     else:
         exe = config.CHROME_PATH
+    args = list(CHROME_ARGS) if chrome_args is None else list(chrome_args)
     kw = dict(
         executable_path=exe,
         headless=headless,
-        args=CHROME_ARGS if chrome_args is None else list(chrome_args),
+        args=args,
     )
-    if os.getenv("IR_BROWSER_PROXY", "1").strip().lower() not in ("0", "false", "no"):
+    if os.getenv("IR_BROWSER_PROXY", "0").strip().lower() not in ("0", "false", "no"):
         proxy = (os.getenv("IR_BROWSER_PROXY", "").strip()
                  or os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
                  or os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY"))
         if proxy:
-            kw["proxy"] = {"server": proxy}
+            # 2026-10-02：g.alicdn.com（阿里验证码 SDK 源）**直连不可达**，
+            # 必须走 Clash 代理才返回 200；而 sso 又必须绕开 Clash（见下方
+            # 直连分支注释：Clash 把 sso 路由到国外节点 → ERR_CONNECTION_CLOSED）。
+            # 所以代理模式要把 sso 放进 bypass 走真实直连，其余（含 g.alicdn.com）
+            # 走 Clash，验证码才能加载出来。
+            # sso 登录页是 JS 渲染的，它的 JS/CSS 资源从 openxlab/intern-ai
+            # 的子域加载；这些子域必须走真实直连（此前纯直连 = --no-proxy-server
+            # 时一切正常）。只有 g.alicdn.com 这类外部 CDN 必须走 Clash 代理
+            # （直连不可达）。所以把整个 openxlab/intern-ai 域 bypass 直连，
+            # 其余（含验证码 SDK 源）走代理。
+            kw["proxy"] = {"server": proxy, "bypass": ".openxlab.org.cn,.intern-ai.org.cn"}
+    else:
+        # 🔴 2026-10-02 实测（本机 Clash 系统代理=7897）：
+        #    **不加 launch proxy 时，Chrome 仍会走 Windows 系统代理** ——
+        #    本机系统代理指向 Clash(7897)，Clash 把 `sso.openxlab.org.cn`
+        #    路由到**国外节点**（出口实测 54.168.101.58 日本 / 18.138.188.208 新加坡），
+        #    国外节点到国内 sso 的 TLS 握手直接失败 → `ERR_CONNECTION_CLOSED`
+        #    / 页面永远加载不出（用户看到的"浏览器卡死/自动挂掉"）。
+        #    而 curl `--noproxy` 直连 sso = 200 OK 0.40s，证明**真实国内直连是通的**。
+        #    ⇒ 必须显式 `--no-proxy-server` 让 Chrome 绕开系统代理，才真正直连。
+        #    （`IR_BROWSER_PROXY=1` 时仍走代理，供确有需要时用。）
+        args.append("--no-proxy-server")
     return kw
 
 
@@ -122,47 +145,72 @@ class BrowserSession:
     理由见 `_launch_kwargs()` —— **探针要注入启动参数请用它，别改全局**。
     """
 
-    def __init__(self, headless: bool = True, chrome_args=None):
+    def __init__(self, headless: bool = True, chrome_args=None, proxy: str = None):
         self.headless = headless
         self.chrome_args = chrome_args
+        # 🔴 Camoufox 的代理是**启动级**：一个实例固定一个出口。
+        self.proxy = proxy
+        self._cm = None            # Camoufox 上下文管理器
         self._pw = None
         self._browser = None
         self.launch_ms = 0
 
     def __enter__(self):
-        from playwright.sync_api import sync_playwright
-
         t0 = time.time()
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            **_launch_kwargs(self.headless, self.chrome_args))
+        self._cm = launch_browser(self.proxy, headless=self.headless)
+        self._browser = self._cm.__enter__()
         self.launch_ms = round((time.time() - t0) * 1000)
         return self
 
     def __exit__(self, *exc):
-        """🔴 不调 `browser.close()` / `pw.stop()` —— 本机实测二者都会**挂死**
-        （不是抛异常，是永远不返回，2026-09-30 探针确认）。改为直接杀
-        driver 进程树：node driver 是 python 子进程、chrome 是 node 子进程，
-        杀树 = 全部收干净。见 `waf_bypass.kill_driver_tree`。"""
-        pw, self._pw, self._browser = self._pw, None, None
-        if pw is not None:
-            from ..waf_bypass import kill_driver_tree
-            kill_driver_tree(pw)
+        """Camoufox 的 `__exit__` 会 close 浏览器并拆掉 playwright 会话。
+
+        🔴 必须走它的 `__exit__`（不是 `kill_driver_tree`）：会话不拆的话，
+        同一线程后续任何 `Camoufox()` / `sync_playwright().start()` 都会报
+        "Sync API inside the asyncio loop"。
+        """
+        cm, self._cm, self._browser = self._cm, None, None
+        if cm is not None:
+            try:
+                cm.__exit__(*exc)
+            except Exception:
+                pass
         return False
 
     def login(self, account: str, password: str, *, timeout: int = 150,
               attempts: int = 3, cooldown: float = 15.0,
               screenshot_prefix: str = None, verbose: bool = False,
               proxy: str = None) -> LoginResult:
-        """在复用的浏览器上登录，失败换新 context 重试。
+        """登录，失败换新 context 重试。
 
-        proxy: 该账号走哪个出口（每个账号独立 context，可各走各的槽位）。
+        proxy: 该账号走哪个出口。🔴 Camoufox 下**代理是启动级** —— 传了与本
+            会话不同的出口时，会绕过复用、每次尝试**新建浏览器**
+            （换出口必须换实例，Firefox 不支持 per-context 换代理）。
         """
+        # 🔴 换出口必须换实例（Camoufox 的代理是启动级），但**不能并行开第二个
+        #    浏览器**：playwright 的 event loop 是**线程级**的 —— `start()` 后
+        #    `run_until_complete` 把 `asyncio._running_loop` 挂在该线程上，且不随
+        #    greenlet 切回而清除。同线程第二次 `start()` 时
+        #    `PlaywrightContextManager.__enter__` 会看到 `loop.is_running()` 为真，
+        #    直接抛 "Sync API inside the asyncio loop"。
+        #    正解：先 `__exit__`（拆会话、清掉 running loop），再 `__enter__` 重建。
+        if (proxy and proxy != self.proxy
+                and current_engine() == "camoufox"):
+            self.proxy = proxy
+            self.__exit__(None, None, None)
+            self.__enter__()
+
         def run_once(tag):
-            return _run_attempt(self._browser, account=account, password=password,
+            return _run_attempt(self._browser, account=account,
+                                password=password,
                                 headless=self.headless, timeout=timeout,
                                 screenshot_prefix=screenshot_prefix,
-                                verbose=verbose, tag=tag, proxy=proxy)
+                                verbose=verbose, tag=tag,
+                                # Camoufox：代理已在启动级注入，context 级不设
+                                proxy=(None if current_engine() == "camoufox"
+                                       else proxy),
+                                fingerprint_browser=(current_engine()
+                                                     == "camoufox"))
 
         return _retry_loop(run_once, attempts=attempts, cooldown=cooldown,
                            verbose=verbose, retry_hint="重试")

@@ -168,13 +168,21 @@ class WafSolver:
         self._resp_q: queue.Queue = queue.Queue()
         self._started = False
         self._start_lock = threading.Lock()
+        self._seq = 0
+        self._seq_lock = threading.Lock()
+
+    def _next_token(self) -> int:
+        with self._seq_lock:
+            self._seq += 1
+            return self._seq
 
     # ── 对外 ─────────────────────────────────────────────────
     def solve(self, challenge_html: str) -> dict[str, str]:
         """[兜底] 算出挑战页要求的 cookie（阻塞，最长 `WAF_SOLVE_TIMEOUT` 秒）。"""
         self._ensure_started()
-        self._req_q.put(("solve", challenge_html))
-        return self._wait()
+        tok = self._next_token()
+        self._req_q.put((tok, ("solve", challenge_html)))
+        return self._wait(tok)
 
     def browser_post(self, path: str, payload: dict,
                      proxy: str = None) -> dict:
@@ -186,22 +194,39 @@ class WafSolver:
         返回 `{"status": int, "text": str}`。阻塞至多 `WAF_SOLVE_TIMEOUT` 秒。
         """
         self._ensure_started()
-        self._req_q.put(("post", (path, payload, proxy)))
-        return self._wait()
+        tok = self._next_token()
+        self._req_q.put((tok, ("post", (path, payload, proxy))))
+        return self._wait(tok)
 
     def shutdown(self):
         """杀 driver 进程树（run.py 收尾时调用；atexit 也会兜一次）。"""
         self._req_q.put(None)
 
-    def _wait(self):
-        try:
-            kind, val = self._resp_q.get(timeout=config.WAF_SOLVE_TIMEOUT)
-        except queue.Empty as ex:
-            raise RuntimeError(
-                f"WAF 求解超时（>{config.WAF_SOLVE_TIMEOUT}s）") from ex
-        if kind == "err":
-            raise RuntimeError(f"WAF 求解失败: {val}")
-        return val
+    def _wait(self, tok: int):
+        """取回 **自己那次**请求的响应。
+
+        🔴 2026-10-13：原来不带 token，`_wait()` 超时返回后，求解线程**仍在跑**
+        （浏览器启动/ goto 常常超过 90s），它完成后把响应塞回队列 —— 于是
+        **下一次调用会领走上一次的迟到响应**：表现为 JSONDecodeError（空体）、
+        "Target page... closed"、"NS_ERROR_NET_TIMEOUT" 这些**张冠李戴**的错。
+        现在按 token 配对，不匹配的直接丢弃。
+        """
+        deadline = time.time() + config.WAF_SOLVE_TIMEOUT
+        while True:
+            left = deadline - time.time()
+            if left <= 0:
+                raise RuntimeError(
+                    f"WAF 求解超时（>{config.WAF_SOLVE_TIMEOUT}s）")
+            try:
+                rtok, kind, val = self._resp_q.get(timeout=left)
+            except queue.Empty:
+                raise RuntimeError(
+                    f"WAF 求解超时（>{config.WAF_SOLVE_TIMEOUT}s）")
+            if rtok != tok:
+                continue        # 上一次超时留下的迟到响应 → 丢弃
+            if kind == "err":
+                raise RuntimeError(f"WAF 求解失败: {val}")
+            return val
 
     # ── 专用线程 ─────────────────────────────────────────────
     def _ensure_started(self):
@@ -214,40 +239,46 @@ class WafSolver:
             self._started = True
 
     def _loop(self):
-        """playwright 全生命周期都在这个线程（同步 API 的线程绑定约束）。"""
-        from playwright.sync_api import sync_playwright
+        """Camoufox 生命周期都在这个线程（同步 API 的线程绑定约束）。
 
-        pw = sync_playwright().start()
-        atexit.register(kill_driver_tree, pw)
-        # 🔴 headless 特征可能被 WAF 二层级识别（405）；有头更真。
-        #    但**有头需要 XServer + 完整版 chromium**：服务器有 Xvfb（:1）
-        #    且装了完整 chromium → 有头；本机通常只有 headless shell →
-        #    退回无头。两条都能解挑战（cookie 计算不依赖渲染）。
-        os.environ.setdefault("DISPLAY", ":1")
-        browser = None
-        try:
-            browser = pw.chromium.launch(
-                headless=False,
-                args=["--no-sandbox", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled"])
-        except Exception:  # noqa: BLE001 无 XServer / 无完整 chromium
+        🔴 这个**单例浏览器只服务 `_do_solve`** —— 它在假页面里执行挑战 JS，
+        **不联网**，所以不需要代理。`_do_post` 要带槽位出口，而 Camoufox 的
+        代理是**启动级**（Firefox 不支持 per-context 换出口），所以那边每次
+        调用都**新建浏览器实例**。
+        """
+        # 延迟导入：waf_bypass 在 src/ 下，模块级 import browser 会成环。
+        from .browser.launch import launch_browser
+
+        def _start(proxy=None, headless: bool = True):
+            """新建浏览器，返回 `(上下文管理器, browser)`。
+
+            🔴 同一线程**同时只能存在一个** Playwright 会话：常驻单例 + 再新建
+            会直接抛 "Sync API inside the asyncio loop"（注册就是这么挂的）。
+            所以 `_do_solve` / `_do_post` 都走这里，**用完立刻 __exit__**。
+            """
+            cm = launch_browser(proxy, headless=headless)
             try:
-                browser = pw.chromium.launch(
-                    executable_path=find_headless_browser(),
-                    headless=True,
-                    args=["--no-sandbox", "--disable-dev-shm-usage"])
-            except Exception as ex:  # noqa: BLE001
-                self._browser_dead = str(ex)[:200]
-                while True:
-                    item = self._req_q.get()
-                    if item is None:
-                        return
-                    self._resp_q.put((
-                        "err", f"browser unavailable: {self._browser_dead}"))
-                return
+                return cm, cm.__enter__()
+            except Exception:
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+                raise
 
         def _do_solve(challenge_html: str) -> dict[str, str]:
-            """[兜底] 假页面执行挑战 JS，读 cookie（独立 context，用完即关）。"""
+            """[兜底] 假页面执行挑战 JS，读 cookie（独立浏览器，用完即关）。"""
+            cm, browser = _start(None, True)
+            try:
+                return _solve_with(browser, challenge_html)
+            finally:
+                try:
+                    cm.__exit__(None, None, None)
+                except Exception:
+                    pass
+
+        def _solve_with(browser, challenge_html: str) -> dict[str, str]:
+            """在给定 browser 上跑挑战 JS（不联网，所以不需要代理）。"""
             ctx = browser.new_context()
             page = ctx.new_page()
             try:
@@ -272,32 +303,49 @@ class WafSolver:
                     pass
 
         def _do_post(path: str, payload: dict, proxy: str | None) -> dict:
-            """[主路径] 新 context（可带槽位代理）→ 真实过 WAF → 同源 fetch。"""
-            kw = {}
-            if proxy:
-                # 🔴 Chromium 拒绝空密码的代理 URL（ERR_INVALID_AUTH_CREDENTIALS，
-                #    2026-09-30 实测），而 Resin 网关**不校验密码**（实测任意密码
-                #    同出口）→ 空密码补占位符。
-                if ":@" in proxy:
-                    proxy = proxy.replace(":/@", ":x@")
-                kw["proxy"] = {"server": proxy}
-            ctx = browser.new_context(**kw)
+            """[主路径] 新建指纹浏览器（带槽位代理）→ 真实过 WAF → 同源 fetch。
+
+            🔴 Camoufox 的代理是**启动级**，Firefox 不支持 per-context 换出口
+            —— 所以每次调用都新建一个浏览器实例（用完即关，指纹也是全新的）。
+            """
+            # 指纹浏览器（Camoufox）：代理是**启动级**的，context 不再设。
+            cm, br = _start(proxy, False)
+            ctx = br.new_context()
             page = ctx.new_page()
             # 🔴 rotating 网关下页面完整资源加载能拖过 90s（图片/字体/统计
             #    脚本各自都要过一次轮换隧道）。WAF 的挑战 JS 是**主文档内联
             #    的**，穿透只需要：主文档 + 脚本 + 我们自己的 fetch。
             #    其余资源全部 abort —— 首页秒开。
+            # 🔴 滑块验证要拿到**拼图/背景图**才能算缺口，所以渲染 `aa` 页时
+            #    临时放开 image（平时 abort 是为了让主文档秒开 —— rotating
+            #    网关下图片/字体太慢，实测能拖过 90s）。
+            _allow = {"image": False}
+
             def _trim(route):
-                if route.request.resource_type in ("document", "script",
-                                                   "xhr", "fetch"):
+                rt = route.request.resource_type
+                if rt in ("document", "script", "xhr", "fetch"):
+                    route.continue_()
+                elif _allow["image"] and rt == "image":
                     route.continue_()
                 else:
                     route.abort()
 
             page.route("**/*", _trim)
             try:
-                page.goto(f"{config.SSO_BASE}/register",
-                          wait_until="domcontentloaded", timeout=30000)
+                # 🔴 2026-10-13 实测：rotating 网关下 30s 常常不够（槽位体检 10 个
+                #    里 3 个死在 `Page.goto: Timeout 30000ms`）。放宽到 60s，
+                #    并对**瞬时的 goto 失败**重试一次 —— 浏览器路径是目前唯一
+                #    能过 `aliyun_waf_aa` 滑块的路径，它挂了就只能退回 requests
+                #    多写几次 → 触发按 IP 记的 429。
+                for _try in range(2):
+                    try:
+                        page.goto(f"{config.SSO_BASE}/register",
+                                  wait_until="domcontentloaded", timeout=60000)
+                        break
+                    except Exception:
+                        if _try == 1:
+                            raise
+                        page.wait_for_timeout(1500)
                 # 挑战页会自动 reload；cookie 出现 = 已穿透
                 deadline = time.time() + 25
                 while time.time() < deadline:
@@ -314,23 +362,50 @@ class WafSolver:
                     });
                     return {status: r.status, text: await r.text()};
                 }"""
+                # 🔴 path 归一：调用方可能传 gw 相对路径（`/register/byEmail`）
+                #    或完整 URL。fetch 需要能落到 `SSO_GW` 前缀上，否则会打到
+                #    `/register/byEmail`（少一层 gw/uaa-be/api/v1）拿 404/挑战。
+                if not str(path).startswith("http"):
+                    path = f"{config.SSO_GW}{path}"
                 args = {"path": path, "payload": payload}
                 res = page.evaluate(js, args)
-                # 🔴 实测（2026-09-30）：rotating 出口下首个 GET /register 往往
-                #    **不触发挑战**（无 acw_sc__v2），首个 fetch POST 才被 WAF
-                #    以 405 HTML 挑战（XHR 无法跳转）→ 就地把挑战页的
-                #    内联 JS 在当前页面上下文执行（写 cookie），再重放 fetch。
-                for _ in range(2):
-                    if res.get("status") != 405 or "acw_sc__v2" not in res.get(
-                            "text", ""):
+                # 🔴 WAF 拦截处理（2026-10-13 重构）：
+                #    浏览器 fetch 拿到的 WAF 页可能是
+                #      a) 标准 JS 挑战（`acw_sc__v2`，页内含混淆脚本自算 cookie）
+                #      b) `aliyun_waf_aa` 滑块页（阿里云验证码 SDK）
+                #    两者都**不能只执行第一个 script**（那只定义 arg1/setCookie，
+                #    真正算 cookie 的是第二个混淆脚本）。统一做法：把整页
+                #    `set_content` 交给浏览器渲染 —— 它自己会执行挑战 JS 写 cookie /
+                #    渲染滑块，然后重放 fetch。
+                for _ in range(5):
+                    txt = res.get("text", "")
+                    st = res.get("status")
+                    if st not in (200, 405):
                         break
-                    m = re.search(r"<script>(.*?)</script>", res["text"], re.S)
-                    if not m:
+                    is_aa = "aliyun_waf_aa" in txt
+                    is_ch = "acw_sc__v2" in txt
+                    is_405 = (st == 405 and "405 Not Allowed" in txt)
+                    if not (is_aa or is_ch or is_405):
                         break
-                    script = m.group(1).replace(
-                        "document.location.reload()", "void 0;")
-                    page.evaluate(script)
-                    page.wait_for_timeout(300)
+                    body = txt.replace("document.location.reload()", "void 0;")
+                    try:
+                        page.set_content(body, wait_until="domcontentloaded")
+                    except Exception:
+                        break
+                    page.wait_for_timeout(1500)
+                    if is_aa:
+                        _allow["image"] = True      # 让拼图/背景图能加载
+                        from .browser.aliyun_slider import solve_aliyun
+                        if not solve_aliyun(page):
+                            break
+                    else:
+                        # 等浏览器把挑战/指纹 JS 跑完、cookie 落定
+                        d = time.time() + 8
+                        while time.time() < d:
+                            page.wait_for_timeout(400)
+                            if "acw_sc__v2" in {c["name"] for c in ctx.cookies()}:
+                                break
+                    page.wait_for_timeout(500)
                     res = page.evaluate(js, args)
                 return res
             finally:
@@ -338,18 +413,23 @@ class WafSolver:
                     ctx.close()
                 except Exception:
                     pass
+                try:
+                    # 关浏览器并拆掉 playwright 会话（不拆会让后续 Camoufox
+                    # 报 "Sync API inside the asyncio loop"）
+                    cm.__exit__(None, None, None)
+                except Exception:
+                    pass
 
         while True:
             item = self._req_q.get()
-            if item is None:            # shutdown：强杀进程树
-                kill_driver_tree(pw)
+            if item is None:            # shutdown：浏览器都是用完即关，直接退出
                 return
-            kind, data = item
+            tok, (kind, data) = item
             try:
                 if kind == "solve":
-                    self._resp_q.put(("ok", _do_solve(data)))
+                    self._resp_q.put((tok, "ok", _do_solve(data)))
                 else:
                     path, payload, proxy = data
-                    self._resp_q.put(("ok", _do_post(path, payload, proxy)))
+                    self._resp_q.put((tok, "ok", _do_post(path, payload, proxy)))
             except Exception as ex:     # noqa: BLE001 单次失败不退出循环
-                self._resp_q.put(("err", str(ex)))
+                self._resp_q.put((tok, "err", str(ex)))

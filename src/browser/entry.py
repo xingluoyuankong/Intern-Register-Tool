@@ -5,7 +5,8 @@
 """
 
 from .attempt import _run_attempt
-from .session import _launch_kwargs, _retry_loop
+from .launch import current_engine, launch_browser
+from .session import _retry_loop
 from .state import LoginResult
 
 
@@ -42,22 +43,22 @@ def login(account: str, password: str, *, headless: bool = True,
     Returns:
         LoginResult；`attempts_used` 记录实际用掉几次尝试，`timings` 是各阶段耗时(ms)。
     """
-    from playwright.sync_api import sync_playwright
-
-    from ..waf_bypass import kill_driver_tree
-
     def run_once(tag):
-        # 🔴 不用 `with sync_playwright()`：它的 __exit__ 会调 stop()，
-        #    本机实测挂死。改 start() + finally 杀 driver 进程树。
-        p = sync_playwright().start()
-        try:
-            browser = p.chromium.launch(**_launch_kwargs(headless, chrome_args))
+        # 🔴 Camoufox：每次尝试**新建浏览器** —— 全新指纹 + 独立出口
+        #    （Firefox 代理是启动级，换出口必须换实例）。
+        #    `with` 退出会自动 close；不 close 会让同一线程后续 Camoufox
+        #    全部报 "Sync API inside the asyncio loop"。
+        with launch_browser(proxy, headless=headless) as browser:
             return _run_attempt(browser, account=account, password=password,
                                 headless=headless, timeout=timeout,
                                 screenshot_prefix=screenshot_prefix,
-                                verbose=verbose, tag=tag, proxy=proxy)
-        finally:
-            kill_driver_tree(p)
+                                verbose=verbose, tag=tag,
+                                # 代理已在启动级注入；context 级不再设，避免覆盖
+                                proxy=None,
+                                # 指纹浏览器：locale/时区交给 Camoufox 的 geoip
+                                # （no_viewport 是 Firefox 专属，Chrome 下必须 False）
+                                fingerprint_browser=(current_engine()
+                                                     == "camoufox"))
 
     return _retry_loop(run_once, attempts=attempts, cooldown=cooldown,
                        verbose=verbose, retry_hint="换新会话重试")

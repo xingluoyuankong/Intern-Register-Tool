@@ -139,6 +139,18 @@ CHROME_ARGS = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
     "--disable-features=IsolateOrigins,site-per-process",
+    # 🔴 2026-10-02：必须显式给窗口尺寸。`viewport=None`（不能覆盖，见
+    #    __init__ 第 7 条）时窗口是默认小尺寸，登录页/验证码元素会被挤到
+    #    视口外 → `wait_for(visible)` 或点击坐标错位 → 登录卡死。
+    #    用**启动参数**调窗口（真实窗口，不触发 CDP Emulation，不会被验证码识别）。
+    "--window-size=1280,900",
+    # 🔴 2026-10-02：登录页是 SPA，入口「使用手机号 / 密码登录」由
+    #    `/static/js/main.*.chunk.js` 渲染。实测该 JS **直连单个就要 20s**
+    #    （curl: http=200 t=20.0s，而主文档只要 0.3s），走代理直接 000。
+    #    浏览器默认并发拉 6 个静态资源 → 触发并发限制被 RESET
+    #    （net::ERR_CONNECTION_RESET）→ SPA 永远渲染不出入口。
+    #    限成每主机 1 条连接 = 串行拉，避开 RESET（代价是慢，但能成功）。
+    "--max-connections-per-host=1",
 ]
 
 
@@ -152,4 +164,4 @@ MAX_CLICKS_PER_ATTEMPT = 3
 
 
 # 页面元素就绪的等待上限（自适应等待，不是固定 sleep）
-UI_WAIT_MS = 15000
+UI_WAIT_MS = 120000

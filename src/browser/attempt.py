@@ -10,6 +10,10 @@
 import random
 import time
 
+import re
+import requests
+
+from .. import config
 from .behavior import _idle_wait, _micro_move, _warmup_mouse
 from .captcha import _click_checkbox, _has_slider
 from .constants import (
@@ -26,44 +30,173 @@ from .state import LoginResult, _AttemptState
 from .urls import build_login_url
 
 
+class _EntryNotRendered(Exception):
+    """SPA 登录入口（账号/密码登录）经多次重试 + 表单直填兜底后仍渲染不出。
+
+    仅用于把"入口没渲染"这一失败原因干净地抛到 `_run_attempt` 的 except
+    分支，进而写进 `LoginResult.reason` / `timings` —— 不新增 LoginResult
+    字段（`reason` 是自由文本、`timings` 是自由字典，足以承载诊断信息）。
+    """
+
+
 # ────────────────────────────────────────────────────────────────
 # 一次尝试的 8 个步骤
 # 切点不是我发明的 —— 来自原注释里的编号 `1)~8)` 与 mark() 埋点
 # ────────────────────────────────────────────────────────────────
+# 🔴 2026-10-02：登录页 SPA 的静态资源（`/static/js/*.chunk.js` 等）
+#    **浏览器直连会被 `ERR_CONNECTION_RESET`**，而 curl/requests 打同样 URL
+#    能拿到（http=200，只是慢 ~20s）。浏览器拉不到主 JS → SPA 渲染不出
+#    「使用手机号 / 密码登录」入口 → 登录卡死。改由 requests 抓取后经
+#    `route.fulfill` 喂回浏览器。按 URL 缓存，避免每次重复拉。
+_STATIC_CACHE: dict = {}
+
+
+def _fetch_static(url: str, timeout: int = 60) -> tuple:
+    """用 requests 直连抓 sso 静态资源，返回 `(content_type, body)`。
+
+    🔴 WAF 挑战页污染（2026-10-03 本机实测）：裸 requests 直连偶发被
+       acw 挑战 —— 响应 200 + HTML（`<script>arg1='…'`），若原样
+       fulfill 给浏览器，SPA 主 JS 就变成挑战页 → 「使用手机号 /
+       密码登录」入口永不渲染 → 登录 8s/120s 超时。
+       修复两层：
+       ① 检测挑战页 → 就地算 `acw_sc__v2` cookie 重放一次（与 sso.py
+          同款算法）；
+       ② 只缓存**确认非挑战**的结果，挑战响应绝不进缓存。
+    """
+    if url in _STATIC_CACHE:
+        return _STATIC_CACHE[url]
+    sess = requests.Session()
+    # 关 trust_env：本机 HTTP_PROXY/HTTPS_PROXY 会把请求带进 Clash，
+    # 而 Clash 到 sso 走不通（实测代理 000）。
+    sess.trust_env = False
+    r = sess.get(url, timeout=timeout)
+    r.raise_for_status()
+
+    def _is_challenge(resp) -> bool:
+        ct = (resp.headers.get("Content-Type") or "").lower()
+        if "javascript" in ct or "json" in ct:
+            return False
+        head = resp.text[:600]
+        return "acw_sc" in head and "arg1=" in head
+
+    if _is_challenge(r):
+        # 挑战页：从 arg1 算 cookie，带 cookie 重放（算法与 SSOClient 同款）
+        m = re.search(r"arg1='([0-9A-Fa-f]{40})'", r.text)
+        if m:
+            from ..sso import SSOClient
+
+            sess.cookies.set("acw_sc__v2", SSOClient._acw_sc_v2(m.group(1)),
+                             domain="sso.openxlab.org.cn", path="/")
+            r = sess.get(url, timeout=timeout)
+            r.raise_for_status()
+        if _is_challenge(r):
+            # 重放仍被挑战 → 当失败处理，让调用方 continue_ 走直连
+            raise RuntimeError("static fetch stuck in WAF challenge")
+
+    ct = r.headers.get("Content-Type", "application/javascript")
+    _STATIC_CACHE[url] = (ct, r.content)
+    return _STATIC_CACHE[url]
+
+
+def _trim_login_factory(st: _AttemptState):
+    """构造登录页请求路由：掐重资源 + 同源 JS 走 requests 回填。
+
+    🔴 2026-10-04 放宽匹配（P0-1）：原实现只对 `/static/` 下的同源资源回填，
+       但 SPA 的 chunk 名/路径可能不含 `/static/`（哈希文件名、`/assets/` 等），
+       漏掉的同源 JS 一旦浏览器直连被 RESET，入口就永不渲染 → 登录 120s 超时。
+       这里放宽成：**同源（`config.SSO_BASE`）的 document/script/xhr/fetch**
+       一律走 `_fetch_static` 回填，其余非必要资源 abort。
+       ⚠ stylesheet 仍放行（不能 abort）—— 登录页靠 CSS 决定元素可见性。
+    """
+
+    def _trim_login(route):
+        u = route.request.url
+        rt = route.request.resource_type
+        if rt in ("image", "font", "media"):
+            route.abort()
+            return
+        # 🔴 2026-10-05 回退：**只回填 `/static/` 静态资源**，绝不拦同源
+        #    xhr/fetch/document。原因：`_fetch_static` 用的是**无 Cookie 的独立
+        #    requests**，拿它回填同源 XHR 会让 SPA 收到"无会话"的响应 →
+        #    验证码浮层/登录表单初始化失败（实测页面报「表单验证失败」且
+        #    验证码浮层永不出现）。这是 P0-1 那次"放宽匹配"引入的回归。
+        if u.startswith(config.SSO_BASE) and "/static/" in u:
+            try:
+                ct, body = _fetch_static(u)
+                route.fulfill(status=200, content_type=ct, body=body)
+            except Exception:
+                route.continue_()
+        else:
+            route.continue_()
+
+    return _trim_login
+
+
 def _step_open_form(page, st: _AttemptState):
     """导航到登录页 → 切"账号登录" → 切"密码登录" tab，直到输入框就绪。
 
-    返回 `acc_box`（账号输入框 locator），供 `_step_type_credentials` 复用 ——
-    原实现就是在这一步创建、下一步复用的，这里保持同一对象。
+    返回 `acc_box`（账号输入框 locator），供 `_step_type_credentials` 复用。
+
+    🔴 2026-10-04（P0-1）：加**分级兜底**，因为实测 42 次 `TimeoutError` 都死在
+       「使用手机号 / 密码登录」入口永不 `visible`。三层：
+         ① 正常路径：等入口可见 → 点它 → 切密码 tab → 等输入框。
+         ② 若入口始终不可见，但**输入框已存在**（表单可能已在密码 tab 或
+            直达渲染）→ 跳过入口/tab 点击，直接返回输入框。
+         ③ 首屏失败则 `goto` 重试（重触发路由回填），最多 3 次。
     """
-    # 🔴 走代理后页面加载明显变慢（实测 60s 会超时，直连时够用）→ 放宽到
-    #    120s，并让 goto 只等 domcontentloaded（验证码是后续轮询等的）。
-    page.goto(build_login_url(), wait_until="domcontentloaded", timeout=120000)
-    st.mark("goto")
+    route_handler = _trim_login_factory(st)
+    # 路由**只挂一次**（重复挂同一 handler 会叠加，unroute 也难清理干净）；
+    # 重试只重跑 goto，靠重新发起的请求再次命中路由回填。
+    page.route("**/*", route_handler)
 
-    # 🔬 预加载实验：页面加载后先闲置一段再操作（原理见 PREWARM_MS）。
-    #    默认 0，不进这个分支 —— 生产行为与实验前完全一致。
-    if PREWARM_MS > 0:
-        page.wait_for_timeout(PREWARM_MS)
-        st.mark("prewarm")
+    def _once():
+        page.goto(build_login_url(), wait_until="domcontentloaded",
+                  timeout=120000)
+        st.mark("goto")
+        if PREWARM_MS > 0:
+            page.wait_for_timeout(PREWARM_MS)
+            st.mark("prewarm")
 
-    # 1) 切到账号登录。
-    #    自适应等待元素可点，替代原先固定的 2.5~4.2s —— 快且更稳
-    #    （慢机器上固定 sleep 反而不够）。
-    entry = page.get_by_text("使用手机号 / 密码登录", exact=False).first
-    entry.wait_for(state="visible", timeout=UI_WAIT_MS)
-    entry.click(timeout=8000)
+        acc_box = page.locator("#normal_login_account")
 
-    # 2) 切到密码登录 tab，等输入框真正就绪
-    tab = page.get_by_text("密码登录", exact=True).first
-    tab.wait_for(state="visible", timeout=UI_WAIT_MS)
-    tab.click(timeout=8000)
-    acc_box = page.locator("#normal_login_account")
-    acc_box.wait_for(state="visible", timeout=UI_WAIT_MS)
-    # 保留一点自然停顿（真人不会 0ms 内连续操作），但远短于原先的固定值
-    page.wait_for_timeout(random.randint(120, 300))
-    st.mark("form_ready")
-    return acc_box
+        # ① 正常路径：入口 → 密码 tab → 输入框
+        try:
+            entry = page.get_by_text("使用手机号 / 密码登录",
+                                     exact=False).first
+            entry.wait_for(state="visible", timeout=UI_WAIT_MS)
+            try:
+                entry.click(timeout=8000)
+            except Exception:
+                entry.click(timeout=8000, force=True)
+            tab = page.get_by_text("密码登录", exact=True).first
+            tab.wait_for(state="visible", timeout=UI_WAIT_MS)
+            try:
+                tab.click(timeout=8000)
+            except Exception:
+                tab.click(timeout=8000, force=True)
+            acc_box.wait_for(state="visible", timeout=UI_WAIT_MS)
+        except Exception as exc:      # noqa: BLE001 落到②兜底
+            # ② 兑底：入口不可见，但输入框可能已在（password tab 默认或直达）。
+            st.ev("open_form_fallback", f"entry/tab failed: {type(exc).__name__}")
+            try:
+                acc_box.wait_for(state="visible", timeout=15000)
+            except Exception:
+                raise exc            # 两层都不行 → 上抛给③重试
+
+        page.wait_for_timeout(random.randint(120, 300))
+        st.mark("form_ready")
+        return acc_box
+
+    # ③ 分级重试：首屏渲染失败（常见于静态资源回填对不上）→ 重新 goto
+    last_exc = None
+    for i in range(3):
+        try:
+            return _once()
+        except Exception as exc:      # noqa: BLE001
+            last_exc = exc
+            st.ev("open_form_retry", f"#{i + 1} {type(exc).__name__}")
+            page.wait_for_timeout(1000)
+    raise last_exc
 
 
 def _step_type_credentials(page, st: _AttemptState, acc_box, account: str,
@@ -128,6 +261,14 @@ def _step_wait_captcha(page, st: _AttemptState, *, timeout: int, vw: int, vh: in
     while (time.time() - t_cap) < timeout and cap["init"] < 2:
         if st.jwt:
             break
+        # 🔴 Path A：无感验证（TRACELESS）**自己通过** —— 判据是
+        #    `VerifyCaptchaV3` 返回 ok 且 init 仍是 1（不会降到 2）。
+        #    此时 SDK 已放行，再死等 `init >= 2` 永远等不到
+        #    （2026-10-02 实测：代理环境下 g.alicdn 可达 → T001 无感通过
+        #    → 卡满 timeout 150s）。提前退出，交给 `_build_result` 收 jwt/cookie。
+        if cap["init"] >= 1 and cap["last_ok"]:
+            st.ev("captcha_path_a", "traceless passed, no downgrade")
+            break
         if (time.time() - t_cap) < MICRO_BUDGET_S:
             cur = _micro_move(page, cur, vw, vh, stats=st.mv)
         else:
@@ -152,17 +293,50 @@ def _step_click_until_jwt(page, st: _AttemptState, *, vw: int, vh: int, cur: tup
                           verbose: bool) -> tuple:
     """点复选框（最多 `MAX_CLICKS_PER_ATTEMPT` 轮），返回新光标位置。"""
     cap = st.cap
+    # 🔴 2026-10-05：T001 无感通过后，交互式「确认您不是机器人」浮层是**延迟出现**
+    #    的（实测约 5~12s 才渲染出 `#aliyunCaptcha-checkbox-icon`）。而
+    #    `_click_checkbox` 里 `bounding_box` 对"存在但不可见"会**立刻返回 None**
+    #    （不等待），于是紧接着 T001 就去点会瞬间失败。必须先**轮询等它可见**。
+    deadline = time.time() + 25
+    while time.time() < deadline and not st.jwt:
+        try:
+            icon = page.locator("#aliyunCaptcha-checkbox-icon").first
+            box = icon.bounding_box(timeout=1000)
+            if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+                break
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+
     # 8) 点击复选框，最多 MAX_CLICKS_PER_ATTEMPT 轮
     for attempt in range(MAX_CLICKS_PER_ATTEMPT):
         if st.jwt:
             break
+        # 🔴 2026-10-05 关键修复：**不再对 Path A（T001 无感通过）走"只等不点"
+        #    的捷径**。实测（本机抓包 + DOM 快照）T001 无感通过后，页面**仍然**
+        #    弹出「请完成安全验证 / 确认您不是机器人」浮层（`#aliyunCaptcha-window-popup`
+        #    + `#aliyunCaptcha-checkbox-icon`），**必须点这个复选框**才会触发
+        #    `login/byAccount` 并写入 `uaa-token`。
+        #    旧逻辑在 `init<=1 and last_ok` 时跳过点击、只等 10s → 永远拿不到 jwt，
+        #    表现为 `captcha rejected (T001)`（其实验证码是过的，只是没点确认）。
+        #    手动点 `#aliyunCaptcha-checkbox-icon` 后立即 `byAccount 200` + jwt 落地。
+        #    `_click_checkbox` 已带 6s 短超时、拿不到框返回 False（不再炸整次尝试），
+        #    所以这里**无条件尝试点击**是安全的；真没框时下面会退化成等 token。
         cur, clicked = _click_checkbox(page, cur)
         st.ev(f"click#{attempt + 1}", f"clicked={clicked}")
         if verbose:
             print(f"    [login] click #{attempt + 1} at "
                   f"({cur[0]:.0f},{cur[1]:.0f}) clicked={clicked}", flush=True)
         if not clicked:
-            page.wait_for_timeout(1200)
+            # 没有复选框（或还没渲染）：退化成等 token 落地（真·Path A 场景），
+            # 等一小会儿再看下一轮；别像旧逻辑那样直接 break 放弃。
+            for _ in range(6):
+                page.wait_for_timeout(1000)
+                if st.jwt:
+                    break
+            if st.jwt:
+                break
+            page.wait_for_timeout(800)
             continue
 
         # 等本轮结果（必须 pump 事件）。同时继续做小幅移动，
@@ -261,7 +435,7 @@ def _block_heavy_resources(route):
 def _run_attempt(browser, *, account: str, password: str, headless: bool,
                  timeout: int, screenshot_prefix: str = None,
                  verbose: bool = False, tag: str = "",
-                 proxy: str = None) -> LoginResult:
+                 proxy: str = None, fingerprint_browser: bool = False) -> LoginResult:
     """在给定 browser 上跑一次登录尝试。
 
     这里**只负责编排**：建 context → 注册响应回调 → 依次调用 8 个步骤 → 折结果。
@@ -273,13 +447,25 @@ def _run_attempt(browser, *, account: str, password: str, headless: bool,
     """
     st = _AttemptState(verbose=verbose)
 
-    # 不覆盖 viewport：见文件头第 7 条
-    ctx_kwargs = dict(
-        locale="zh-CN",
-        timezone_id="Asia/Shanghai",
-        viewport=None,
-        color_scheme="light",
-    )
+    # 🔴 指纹浏览器（Camoufox）：locale / 时区 / 屏幕由启动参数 `geoip=True`
+    #    **自动跟随出口 IP**。这里再写死成 zh-CN + Asia/Shanghai 就会造成
+    #    「美国 IP + 中国时区」这类自相矛盾的指纹 —— 反而更容易被风控识别。
+    #    所以指纹浏览器下只留最小 context 参数，其余交给 Camoufox。
+    if fingerprint_browser:
+        # 🔴 `no_viewport=True` 不能省：Camoufox 只在 **persistent_context**
+        #    分支自动补 `no_viewport`；我们用的是 `firefox.launch()`（非 persistent），
+        #    而 `window=(1280,900)` 会 spoof 窗口尺寸 —— 两者冲突会让 Juggler
+        #    死锁（表现为 "Sync API inside the asyncio loop" /
+        #    "gBrowser never populated"）。必须显式关掉 viewport 模拟。
+        ctx_kwargs = dict(color_scheme="light", no_viewport=True)
+    else:
+        # 不覆盖 viewport：见文件头第 7 条
+        ctx_kwargs = dict(
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            viewport=None,
+            color_scheme="light",
+        )
     if proxy:
         # 🔴 Playwright 的 proxy 必须把认证拆成独立字段，**不能**把
         #    `user:pass@` 塞进 server URL —— 塞进去 Chrome 会静默忽略认证，
@@ -305,6 +491,19 @@ def _run_attempt(browser, *, account: str, password: str, headless: bool,
     #    登录只依赖 HTML + JS（验证码脚本），其余一律掐掉。
     page.route("**/*", _block_heavy_resources)
     page.on("response", st.on_response)
+    # 🔴 诊断：登录页是 SPA，「使用手机号 / 密码登录」由 JS 渲染。它引用的
+    #    JS 分两类：本地 /static/js/*.chunk.js（sso 域名）和外部 CDN
+    #    （g.alicdn.com / o.alicdn.com / res.wx.qq.com）。任一类加载失败，
+    #    SPA 就渲染不出入口，表现为 wait_for 超时却看不出原因 —— 这里打出来。
+    if verbose:
+        def _on_failed(req):
+            try:
+                err = req.failure
+            except Exception:
+                err = "?"
+            print(f"    [net] FAILED {req.url[:130]} err={err}", flush=True)
+
+        page.on("requestfailed", _on_failed)
 
     try:
         acc_box = _step_open_form(page, st)

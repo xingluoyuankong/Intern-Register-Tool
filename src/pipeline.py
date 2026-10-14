@@ -384,6 +384,45 @@ def settle_lease(pool, lease, ok: bool, rec) -> None:
         pool.report_failed(lease, rec.error[:80])
 
 
+_IP_CACHE: dict = {}          # 槽位串 -> (IP, 探测时刻)
+_IP_CACHE_TTL = 300.0         # 5 分钟：出口会漂，缓存不能太旧
+
+
+def probe_exit_ip(proxy: str, timeout: int = 8) -> str:
+    """量出这条订阅链接**此刻**的出口 IP（带短缓存）。
+
+    🔴 为什么必须现量：订阅链接的出口 IP 定时自动漂移，静态映射表
+       （`IR_SLOT_EGRESS_IPS`）会过期。要看"这次注册走的哪个 IP"，
+       只能在这条链接正被使用的那一刻量 —— 而且必须用**同一个代理**
+       发探测请求，否则量到的是本机出口。
+
+    缓存 5 分钟：一轮里换出口重试 3 次会对同一条链接探测多次，
+    短缓存既避免重复请求，又不会让漂移后的结果错太久。
+    """
+    if not proxy:
+        return ""
+    now = time.time()
+    hit = _IP_CACHE.get(proxy)
+    if hit and (now - hit[1]) < _IP_CACHE_TTL:
+        return hit[0]
+    import re as _re
+
+    import requests
+
+    for u in ("https://api.ipify.org", "https://checkip.amazonaws.com",
+              "https://icanhazip.com"):
+        try:
+            r = requests.get(u, proxies={"http": proxy, "https": proxy},
+                             timeout=timeout)
+            ip = (r.text or "").strip()
+            if _re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", ip):
+                _IP_CACHE[proxy] = (ip, now)
+                return ip
+        except Exception:      # noqa: BLE001 候选逐个试，全挂才放弃
+            continue
+    return ""
+
+
 def gen_username(prefix: str = "lz") -> str:
     return prefix + "".join(random.choices(string.digits, k=6))
 
@@ -419,6 +458,11 @@ class AccountRecord:
     # 🔴 记它是为了事后能回答"被封的到底是哪个出口" —— 光看 `B0000`
     #    不知道是 IP 维度还是别的维度，必须能把它和出口对应起来。
     proxy_slot: str = ""
+    # 🔴 注册那一刻这条订阅链接的**实测出口 IP**（2026-10-04 新增）。
+    #    订阅链接的出口 IP 会定时漂移，所以这个值是"当次注册时的快照"，
+    #    用于事后回答"哪条链接/哪个 IP 段当时能注册成功"。
+    #    空 = 探测失败或未走槽位池。
+    proxy_ip: str = ""
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False, indent=2)
@@ -490,11 +534,12 @@ def stage_register(mail: TempMailClient, sso: SSOClient, rec: AccountRecord,
                 f"已确认 {QUOTA_MSG_CODE}（累计配额触顶），未发注册请求")
 
         t = time.time()
-        # 🔴 会话链必须**紧贴**注册请求重建：screen_slots（prime→register
-        #    零间隔）同一批槽位 10/50 穿透，而把 prime 放在建邮箱/限速
-        #    等待之前的 run.py 是 0/10。会话链有时效，隔了几秒就废 ——
-        #    这里在注册发请求前再种一次，把窗口压到最小。
-        sso.prime_session()
+        # 🔴 浏览器主路径下**不要** prime_session：浏览器自己会 `goto /register`
+        #    走完整的 GET → JS → cookie 会话链，指纹也是真的。先用 requests 裸
+        #    GET 一遍等于拿**非浏览器指纹**多打一次这个出口，实测：同一个能注册
+        #    成功的槽位，加了 requests prime 之后变 429。
+        if not config.REGISTER_VIA_BROWSER:
+            sso.prime_session()
         reg = sso.register(rec.username, rec.email, rec.password)
         mark("register_call", t)
         if not reg.ok:
@@ -509,6 +554,15 @@ def stage_register(mail: TempMailClient, sso: SSOClient, rec: AccountRecord,
             raise RuntimeError(f"register failed: {detail}")
         rec.sso_uid = reg.sso_uid
         rec.stages["register"] = "ok"
+        # 🔴 换出口重试场景（2026-10-03 本机实测 bug）：第 1 次尝试失败时
+        #    except 分支已把 rec.status 改成 "failed"、rec.error 写入旧错；
+        #    第 2 次成功走到这里若**不清掉残留**，消费者会因
+        #    `rec.status != "init"` 跳过登录建 key —— 出现
+        #    "registered+activated 但最终 failed: 429（上一次的错）" 的鬼账。
+        #    成功必须无条件覆盖失败残留。
+        rec.status = "init"
+        rec.error = ""
+        rec.error_kind = ""
         # 只有**成功**才计入本地配额 —— 失败的不占额度，记了会虚高。
         quota.record(rec.email, scope=quota_scope)
         log(f"registered: uid={rec.sso_uid} user={rec.username}")
@@ -588,6 +642,32 @@ def stage_register(mail: TempMailClient, sso: SSOClient, rec: AccountRecord,
 # ────────────────────────────────────────────────────────────────
 # Stage 3+4+5：登录 → 领额度 → 建 Key → 校验
 # ────────────────────────────────────────────────────────────────
+def login_identifier(email: str, username: str = "") -> str:
+    """登录页账号框该填什么（email 或 SSO 用户名）。
+
+    🔴 2026-10-05 实测（服务器 + 截图证据）：登录页账号框带前端校验
+       **「用户名不超过 40 个字符」** —— 超过就**拒绝提交**，于是
+       `login/byAccount` 永不发出 → 验证码 SDK 从不初始化（`init=0`）→
+       登录卡满 150s 超时。**这不是网络问题，是前端校验。**
+
+       旁证：台账里**所有**拿到 key 的账号（109 个）邮箱都 ≤40 字符，
+       >40 的一个都没有 —— 反证了「>40 即永远登不上」。
+
+       `temp.tf` 生成的别名（`firstname+随机后缀@outlook.com`）约 10% 超长，
+       这些账号**注册成功却永远拿不到 key**（旧代码一直用 email 登录）。
+       对策：超长时改用 **SSO 用户名**（`lzXXXXXX`，8 位）登录 ——
+       登录框本就叫「用户名」，实测 `ok=True jwt=333B` 可过。
+
+    ⚠ 这是**共享判据**：`pipeline.stage_login_key`（run.py 主链路）与
+      `tools/run_downstream.py`（收割工具）都必须走它，否则两边行为分叉。
+    """
+    email = (email or "").strip()
+    user = (username or "").strip()
+    if len(email) > 40 and user:
+        return user
+    return email
+
+
 def stage_login_key(rec: AccountRecord, *, session=None, headless: bool = True,
                     key_name: str = "default", verbose: bool = True,
                     screenshot_prefix: str = None, log=print,
@@ -611,7 +691,8 @@ def stage_login_key(rec: AccountRecord, *, session=None, headless: bool = True,
     t0 = time.time()
     try:
         if session is not None:
-            res = session.login(rec.email, rec.password,
+            res = session.login(login_identifier(rec.email, rec.username),
+                                rec.password,
                                 screenshot_prefix=screenshot_prefix,
                                 verbose=verbose,
                                 # 🔴 登录浏览器**默认不走代理**（2026-10-01 实测）：走 Resin 时
@@ -623,7 +704,8 @@ def stage_login_key(rec: AccountRecord, *, session=None, headless: bool = True,
         else:
             from .browser import login as browser_login
 
-            res = browser_login(rec.email, rec.password, headless=headless,
+            res = browser_login(login_identifier(rec.email, rec.username),
+                                rec.password, headless=headless,
                                 screenshot_prefix=screenshot_prefix,
                                 verbose=verbose,
                                 # 🔴 只试 1 次：走代理时登录页加载不动是常态，
@@ -834,7 +916,10 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
                         log=lambda m: print(m, flush=True))
     count = gov.allow(count)
 
-    reg_conc = reg_concurrency or min(count, REG_CONCURRENCY)
+    # P2: 池模式下注册并发度由**出口数**决定（同出口互斥已启用）。
+    #    注册阶段每个线程会占一个出口槽，超过出口数只会排队、不增吞吐。
+    eff_max = pool.egress_n if pool else REG_CONCURRENCY
+    reg_conc = min(reg_concurrency or REG_CONCURRENCY, count, eff_max)
     results: list = [None] * count
     q: queue.Queue = queue.Queue()
     print_lock = threading.Lock()
@@ -849,37 +934,42 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
 
         return log
 
-    # ── 消费者：每个 worker 一个浏览器会话，复用进程 ──────────
+    # ── 消费者：每个账号一个全新浏览器 ────────────────────────
     def consumer_worker(wid: int):
         from .browser import BrowserSession
 
         try:
-            with BrowserSession(headless=headless) as sess:
-                if verbose:
+            while True:
+                item = q.get()
+                try:
+                    if item is None:
+                        return
+                    idx, rec = item
+                    # init = 还没被处理过；failed / skipped 都无需登录。
+                    if rec.status != "init":
+                        continue
                     with print_lock:
-                        print(f"[worker {wid + 1}] browser ready "
-                              f"({sess.launch_ms}ms)", flush=True)
-                while True:
-                    item = q.get()
-                    try:
-                        if item is None:
-                            return
-                        idx, rec = item
-                        # init = 还没被处理过；failed / skipped 都无需登录。
-                        if rec.status != "init":
-                            continue
-                        with print_lock:
-                            print(f"[{idx + 1}/{count}] "
-                                  f"login+key: {rec.email}", flush=True)
-                            stage_login_key(
-                                rec, session=sess, key_name=key_name,
-                                verbose=False, log=make_log(idx), verify=False,
-                                proxy=rec.proxy_slot or None,
+                        print(f"[{idx + 1}/{count}] "
+                              f"login+key: {rec.email}", flush=True)
+                    # 🔴 每个账号**新建一个浏览器实例**，不复用长驻会话：
+                    #   · Camoufox 的指纹是**启动时随机生成**的，多个账号复用同一
+                    #     实例 = 共用一套指纹，风控上等于自己标记自己；
+                    #   · 长驻实例会被并发的 WAF 解题浏览器冲掉 —— 实测
+                    #     `new_context` 报 "browser has been closed"。
+                    with BrowserSession(headless=headless) as sess:
+                        if verbose:
+                            with print_lock:
+                                print(f"[worker {wid + 1}] browser ready "
+                                      f"({sess.launch_ms}ms)", flush=True)
+                        stage_login_key(
+                            rec, session=sess, key_name=key_name,
+                            verbose=False, log=make_log(idx), verify=False,
+                            proxy=rec.proxy_slot or None,
                             screenshot_prefix=(f"{screenshot_prefix}_{idx + 1}"
                                                if screenshot_prefix else None),
                         )
-                    finally:
-                        q.task_done()
+                finally:
+                    q.task_done()
         except Exception as ex:
             # 浏览器起不来时不能让整批卡死：把队列里剩下的都标记失败
             with print_lock:
@@ -946,7 +1036,13 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
                 if pool is not None:
                     # 上一轮失败 → 归还旧租约再换一个（exclude 保证不拿同一个）
                     if lease is not None:
-                        pool.report_failed(lease, "换出口重试", cooldown=5.0)
+                        # 🔴 429 是**按出口 IP** 记的写限流：刚被限流的出口短期内
+                        #    不会恢复，5s 冷却后又被挑中 = 白试一次 + 继续烧它。
+                        #    给被限流的出口一个长冷却，逼池子转到其它出口。
+                        #    （槽位体检实测：同一个号连试 3 个出口全是 429，
+                        #     而池子里确实躺着能注册成功的出口。）
+                        _cd = 180.0 if "限流" in (rec.error or "") else 5.0
+                        pool.report_failed(lease, "换出口重试", cooldown=_cd)
                         lease = None
                     # 独占一个出口 IP。全池都在冷却时阻塞等待，超时抛 TimeoutError。
                     #
@@ -978,7 +1074,13 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
                     #    （本项目实测已发生过，见 config.SLOT_EGRESS_IPS 的说明）。
                     scope = config.slot_scope(lease.url)
                     rec.proxy_slot = lease.url      # 🔴 必须是**槽位串**
-                    log(f"出口槽位 {lease}（配额记在 {scope} 名下）"
+                    # 🔴 记下这一刻的真实出口 IP（2026-10-04 新增）：
+                    #    订阅链接的出口会漂移，静态 IP 映射表不可靠，
+                    #    "当时实际用的哪个 IP"只能在**用它的那一刻**量。
+                    #    带 5 分钟缓存：同一轮内换出口重试不会重复打探测请求。
+                    rec.proxy_ip = probe_exit_ip(lease.url)
+                    log(f"出口槽位 {lease}（出口 IP {rec.proxy_ip or '未知'}，"
+                        f"配额记在 {scope} 名下）"
                         + (f" [第 {_attempt + 1}/{tries} 次]" if tries > 1 else ""))
                     # 这个出口自己的配额（不是全局的 —— 见 quota.status 的说明）。
                     # 复查的判据在 `QuotaGovernor.claim_slot`（理由也写在那里）。
@@ -992,22 +1094,28 @@ def run_batch(*, count: int, workers: int = 2, headless: bool = True,
                 # 🔴 proxy 必须传**具体值**给这个 client，不能改全局 `IR_PROXY` ——
                 #    多个 producer 同时改全局会互相踩（见 config.apply_proxy）。
                 sso = SSOClient(proxy=(lease.url if lease else None))
-                # 🔴 池化模式下：撞挑战页**立刻放弃、换出口**，不要原地解题。
-                #    理由（2026-10-01 实测卡死复盘）：browser 兜底单次 90s ×
-                #    4 次尝试 = 一个号最长卡 6 分钟零输出。而池子里本来就有
-                #    screen 筛过的 CLEAR 出口 —— 换出口比解题快几个数量级。
-                #    非池模式（单代理/直连）没有"换出口"这条路，保持解题。
-                if lease is not None:
-                    sso.abandon_on_challenge = True
-                # 种会话链（GET 注册页）：跳过它裸 POST 的挑战重放会被持续
-                # 挑战 —— 见 sso.prime_session 的终局实测注释。
-                sso.prime_session()
+                # 🔴 撞挑战页就**正常解题**（browser 路径实测 4 秒解出
+                #    acw_sc__v2），不要放弃。
+                #    2026-10-01 复盘：一度以为"解题会卡死"而改成放弃换出口，
+                #    那是误判 —— 卡死的真因是 `find_headless_browser` 找不到
+                #    playwright 浏览器、回退到系统 Chrome 挂死（已修）。
+                #    解题只要 4s，比换出口（重建邮箱+重注册）快得多。
+                sso.abandon_on_challenge = False
+                # 🔴 2026-10-13：这里**不再**调 prime_session —— `stage_register`
+                #    内部（紧贴 register 前）已经调了一次。两处都调会 GET 两次
+                #    /register，把会话链搅乱（WAF 更容易挑战）。
                 ok = stage_register(mail, sso, rec, mail_domain=mail_domain,
                                     log=log, gate=reg_gate, should_stop=gov.hit,
                                     quota_scope=scope)
                 if ok:
                     break
-                # 业务层明确拒绝（用户名重复等）→ 换出口也没用，别浪费邮箱
+                log(f"[REGDBG] 第 {_attempt + 1}/{tries} 次失败 kind={rec.error_kind} err={(rec.error or '')[:150]}")
+                # 🔴 429 是**全局**限流，不是按出口 IP 记的 —— 2026-10-13 实测：
+                #    不走代理直连注册也返回 `{"error":"Too many request"}`。
+                #    所以换出口对它无效，只能**整体放慢**：被限流后先退避再试
+                #    下一个出口，否则一轮 3 个出口连着打 = 把限流桶越捅越满。
+                if "限流" in (rec.error or ""):
+                    time.sleep(45.0 + random.uniform(0, 15.0))
                 if rec.error_kind in (ERR_REJECTED, ERR_QUOTA_GUARD):
                     break
         except Exception as ex:

@@ -105,7 +105,9 @@
 """
 
 import json
+import hashlib
 import os
+import requests
 import socket
 import threading
 import time
@@ -311,6 +313,19 @@ class ProxySlotPool:
         self._cool_until: dict[int, float] = {}
         # slot -> 累计使用次数（用于均衡分配）
         self._uses: dict[int, int] = {i: 0 for i in range(1, len(slots) + 1)}
+        # 🔴 跨进程轮转（2026-10-04 逆向分析出的头号瓶颈）：
+        #    `loop_run.sh` 每轮都**新起一个 run.py 进程**。上面这份 `_uses`
+        #    是进程内存态 → 每轮归零 → `_pick_locked` 的排序键
+        #    `(uses, slot号)` 在所有 uses==0 时退化为"取槽位号最小的" ⇒
+        #    **每一轮都从 slot1 开始**（实测 20 条代理只有 slot1/2/3 被用到，
+        #    其余 17 条从未分配，前 3 个出口被打到 429 + 配额满，成功率 4.3%）。
+        #    把计数落盘，跨进程继承，20 条槽位才会真正轮转起来。
+        self._uses_file = os.environ.get(
+            "IR_SLOT_USES_FILE",
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                         ".workbuddy-ai", "proxypool", "slot_uses.json"))
+        self._uses_file = os.path.normpath(self._uses_file)
+        self._load_uses()
         # slot -> 被判封禁的次数 / 最近原因
         self._bans: dict[int, int] = {}
         self._ban_reason: dict[int, str] = {}
@@ -556,6 +571,8 @@ class ProxySlotPool:
                     if self._slot_ip is not None:
                         ip = self._slot_ip[slot]
                         self._ip_held[ip] = self._ip_held.get(ip, 0) + 1
+                    # 落盘：让**下一个进程**从这儿接着轮转（见 __init__ 的注释）
+                    self._save_uses()
                     return SlotLease(slot=slot, url=self._slots[slot - 1])
                 if not wait_worthwhile:
                     # 池子里没有任何合格槽位 —— 等下去也不会变。
@@ -575,6 +592,44 @@ class ProxySlotPool:
                 if deadline is not None:
                     wait = min(wait, max(deadline - time.monotonic(), 0.05))
                 self._cond.wait(wait)
+
+    def _load_uses(self) -> None:
+        """从上一次进程继承槽位使用计数（跨进程轮转的前提）。
+
+        槽位串变了（换代理 / 增删槽位）就整份作废重来 —— 否则旧计数会对不上
+        新的槽位号，把流量继续压在"历史用得少"的那几个上，反而更糟。
+        """
+        try:
+            d = json.load(open(self._uses_file, encoding="utf-8"))
+            if not isinstance(d, dict):
+                return
+            if d.get("sig") != self._uses_sig():
+                return
+            saved = d.get("uses") or {}
+            for k, v in saved.items():
+                i = int(k)
+                if i in self._uses:
+                    self._uses[i] = int(v)
+        except Exception:
+            return
+
+    def _uses_sig(self) -> str:
+        n = len(self._slots)
+        head = hashlib.md5(("|".join(self._slots[:3])).encode()).hexdigest()[:8]
+        return f"{n}:{head}"
+
+    def _save_uses(self) -> None:
+        """落盘当前计数（原子写：临时文件 + rename，避免并发读到半截）。"""
+        try:
+            os.makedirs(os.path.dirname(self._uses_file), exist_ok=True)
+            tmp = f"{self._uses_file}.tmp.{os.getpid()}"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"sig": self._uses_sig(),
+                           "uses": {str(k): v for k, v in self._uses.items()},
+                           "ts": time.time()}, f)
+            os.replace(tmp, self._uses_file)
+        except Exception:
+            pass
 
     def _release_locked(self, lease: SlotLease) -> None:
         """把租约还回去（**调用方必须已持有 `self._cond`**）。幂等。
@@ -691,6 +746,19 @@ class ProxySlotPool:
             return None
         return len(set(self._slot_ip.values()))
 
+    @property
+    def egress_n(self) -> int:
+        """对齐注册并发度用的"不同出口数"。
+
+        🔴 配了 `slot_ips` → 出口 IP 去重计数（这才是真正约束注册并发度的单位，
+        见模块 docstring 规则 4）；**没配**（轮换 IP / 订阅链接漂移） → 退回
+        槽位数：每个槽位是一个独立网关入口，轮换代理下约等于"不同的出口"，
+        把并发度对齐到这上面才用得满出口。两者都不应写死成 4。
+        """
+        if self._slot_ip is not None:
+            return len(set(self._slot_ip.values()))
+        return len(self._slots)
+
     def stats(self) -> dict:
         with self._cond:
             now = time.time()      # 与 `_cool_until` 同钟
@@ -751,6 +819,65 @@ def _resolve_slot_ips(slots: list[str], log) -> "dict | None":
     return out
 
 
+def _egress_reaches(slot: str, *, timeout: float = 25.0, log=None) -> bool:
+    """通过槽位代理**真打一枪**目标站 `/register`，验证出口（不只是端口）通。
+
+    🔴 端口活 ≠ 出口通：槽位进程监听着本地端口，但代理链下游出口可能已被墙 /
+    被 ACL 拦 / 节点过期。只查 TCP 端口会放过这类"假活"槽位，让每条注册都败在
+    代理连接上。这里用 `config.apply_proxy` 把槽位挂到一次性 session 上真发一个
+    GET，要求 2xx/3xx 才算出口通（目标站挑战页也是 2xx/3xx，同样算"到得了"）。
+    """
+    try:
+        with requests.Session() as s:
+            config.apply_proxy(s, slot)
+            r = s.get(config.SSO_BASE + "/register", timeout=timeout,
+                      headers={"User-Agent": config.USER_AGENT})
+        return 200 <= r.status_code < 400
+    except Exception as ex:
+        if log:
+            msg = str(ex).splitlines()[0] if str(ex) else ""
+            log(f"⚠ 出口预检失败 {redact.redact_url(slot)}："
+                f"{type(ex).__name__} {msg}".rstrip())
+        return False
+
+
+def _filter_reachable(slots: list[str], *, timeout: float = 25.0,
+                      log=None) -> tuple[list[str], list[str]]:
+    """对槽位逐个验证出口可达，返回 `(可达, 不可达)`。
+
+    ⚠ 必须**串行低并发**（2026-10-04 实测）：
+       - 并发探测本身会互相干扰 —— 高并发(20) 只探出 19 条可用，低并发(4) 探出 34 条；
+       - 超时必须够宽（真实注册用 30s，很多好出口打 sso 要 10~30s），
+         取 8s 会把可用出口误判为死。
+
+    调用方（`build_pool`）另有"**全灭即降级保留全池**"的兑底：万一判定偏严，
+    也不会把整批锁死。
+    """
+    # 🔴 用小并发池（4 路）而非串行：串行 34 条 × 最坏 25s = 14 分钟，把每轮
+    #    注册拖垮；全并发(20+)又会互相干扰、把可用出口误判成死（实测 19 vs 34）。
+    #    4 路是实测折中：既准又能在 ~2 分钟内跑完。
+    from concurrent.futures import ThreadPoolExecutor
+
+    alive, dead = [], []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(_egress_reaches, u, timeout=timeout, log=log): u
+                for u in slots}
+        for fut, u in futs.items():
+            ok = False
+            try:
+                ok = fut.result()
+            except Exception:
+                ok = False
+            (alive if ok else dead).append(u)
+    if dead and log:
+        names = "、".join(redact.redact_url(x) for x in dead)
+        log(f"⚠ 出口预检：{len(dead)}/{len(slots)} 个槽位端口活但**出口打不到"
+            f"目标站**（墙/ACL/节点过期），已剔除 → {names}")
+    if alive and log:
+        log(f"✅ 出口预检：{len(alive)}/{len(slots)} 个槽位出口可达")
+    return alive, dead
+
+
 def build_pool(*, log=None, cooldown: float = None,
                preflight: bool = None) -> "ProxySlotPool | None":
     """按配置建池。**未配置槽位时返回 `None`** —— 调用方据此退回单代理行为。
@@ -789,6 +916,26 @@ def build_pool(*, log=None, cooldown: float = None,
                 f"**代理连接错误**收场，看起来像「换 IP 也不行」，结论是错的。\n"
                 f"  （确定要跳过检查：IR_PROXY_PREFLIGHT=0）")
         slots = alive
+
+        # 🔴 端口活 ≠ 出口通：再过一关**出口可达性**预检（打得到目标站才算活）。
+        #    IR_PROXY_PREFLIGHT_REACH=0 可整体关掉（付不起那次 HTTPS 握手的场景）。
+        #
+        # ⚠ **全灭时降级、不锁死**（2026-10-04 实测定性）：实测遇到"20 个槽位端口
+        #    全活、但出口请求全部 `407 Proxy Authentication Required`"的情形 ——
+        #    那是**订阅链接凭证/网关认证**层面的问题（`resin-proxy...:2268/` 根路径
+        #    返回的是网关说明页，说明网关活着、是"用户名/密码"这一关没过），
+        #    不是"20 个出口同时死了"。若在这里抛 `AllSlotsDead`，会把整轮注册直接
+        #    掐死、无限空转 —— 而真正的错误应该由**注册流程**逐条记录下来。
+        #    ⇒ 只有"**部分可达**"时才用预检结果剔除死槽；"全灭"视为**预检环境
+        #    不可用**，打印告警后**保留原清单继续**，让上层拿到真实失败原因。
+        if config.IR_PROXY_PREFLIGHT_REACH and alive:
+            reach_alive, reach_dead = _filter_reachable(alive, log=log)
+            if reach_alive:
+                slots = reach_alive
+            elif log:
+                log("⚠ 出口预检**全部**不可达（常见于订阅链接凭证失效 / 网关要求"
+                    "认证，如 407）—— 判定为**预检环境不可用**，保留全部槽位继续，"
+                    "不锁死。若注册持续报代理错误，请核对订阅链接是否需要重签。")
 
     slot_ips = _resolve_slot_ips(slots, log)
     if slot_ips is not None and log:

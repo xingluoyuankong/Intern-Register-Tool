@@ -97,11 +97,24 @@ def _eligible(d: dict) -> bool:
     return bool((d.get("email") or "").strip() and (d.get("password") or "").strip())
 
 
+def _login_id(d: dict) -> str:
+    """登录页账号框该填什么 —— 委托给**共享判据** `pipeline.login_identifier`。
+
+    为什么不让这里自己写一份：`run.py` 主链路（`pipeline.stage_login_key`）
+    与收割工具必须用**同一条**判据，否则两边行为分叉（一边能登录、一边不能），
+    排查时会被这种分叉骗。详细理由（40 字符前端校验 + 用户名登录）见
+    `src/pipeline.py:login_identifier`。
+    """
+    from src.pipeline import login_identifier
+
+    return login_identifier(d.get("email", ""), d.get("username", ""))
+
+
 # ────────────────────────────────────────────────────────────────
 # 单账号：Stage 3~6
 # ────────────────────────────────────────────────────────────────
 def run_one(d: dict, *, headless: bool, create: bool, key_name: str,
-            log=print) -> dict:
+            rekey: bool = False, log=print) -> dict:
     """跑一个账号的下游链路，返回**要合并回台账的字段**（不整条覆盖）。
 
     返回 dict 而不是 AccountRecord：台账里那 38 条从 CSV 恢复的记录字段
@@ -123,11 +136,15 @@ def run_one(d: dict, *, headless: bool, create: bool, key_name: str,
 
     # ── Stage 3：登录 ─────────────────────────────────────────
     t = time.time()
+    login_id = _login_id(d)
     try:
         from src.browser import BrowserSession
 
         with BrowserSession(headless=headless) as sess:
-            res = sess.login(rec.email, rec.password, verbose=False)
+            # 🔴 只试 1 次：与 `pipeline.stage_login_key` 同理由 —— 失败多是
+            #    账号/出口维度的问题，原地重试 3 次 = 白烧 ~8 分钟
+            #    （3×150s 超时 + 冷却）。换号才有意义。收割 80+ 账号时这是关键。
+            res = sess.login(login_id, rec.password, verbose=False, attempts=1)
             timings["browser_launch"] = sess.launch_ms
             if not res.ok:
                 raise RuntimeError(res.reason or "login failed")
@@ -216,12 +233,37 @@ def run_one(d: dict, *, headless: bool, create: bool, key_name: str,
             # 🔴 命中已有 key 时 `ak.key` 是空串（列表不给明文）。
             #    绝不能用它覆盖 rec.api_key —— 见模块 docstring 第 1 点。
             plaintext = ak.key
-            out["key_created"] = "" if ak.key else None
-            log(f"✓ 复用 key「{key_name}」"
-                f"{'（无明文，列表接口不返回）' if not ak.key else ''}")
+            if not plaintext and rekey:
+                # 🔴 2026-10-05：已有同名 key 但明文拿不回来（列表接口不返回）。
+                #    为了拿到**可用明文**只能另建一把 —— `create_key` 非幂等，
+                #    名字带时间戳避免和已有的撞名。收割「已注册未领 key」专用：
+                #    那些账号往往在服务端已有孤儿 key（早期"复用分支丢明文"的
+                #    遗留），但明文已不可考，必须 rekey 才能拿到可用 key。
+                name = f"{key_name}-h{time.strftime('%m%d-%H%M%S')}"
+                ak = dc.create_key(name)
+                plaintext = ak.key
+                out["key_created"] = name
+                log(f"✓ 已有 key「{key_name}」无明文 → 另建「{name}」= "
+                    f"{ak.key[:12]}…")
+            else:
+                # 🔴 2026-10-05 修：`ensure_key` 对**没有该名 key 的账号会新建**
+                #    并返回明文。旧实现只在 create 分支写 `out["api_key"]`，
+                #    于是"复用"分支新建出来的明文被丢掉 —— 收割无 key 账号时
+                #    表现为"key 建了但台账里是空的、拿不回来"。这里补上
+                #    （仅当有明文才写，避免把已有好 key 洗成空串）。
+                out["key_created"] = "" if ak.key else None
+                log(f"✓ 复用/新建 key「{key_name}」"
+                    f"{'（无明文，列表接口不返回）' if not ak.key else ''}")
+            if ak.key:
+                out["api_key"] = ak.key
         out["key_id"] = ak.id
         out["key_masked"] = ak.masked_key
         out["key_status"] = ak.status
+        # 🔴 面板"今日 Key"的统计依据：**key 建成时间**（UTC，与 created_at
+        #    同格式）。没有它，收割今天建出的 key 会按老 created_at（注册日）
+        #    统计 → 面板永远"今日 0"（2026-10-14 实测）。
+        if ak.key:
+            out["key_built_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         timings["key"] = round((time.time() - t) * 1000)
     except Exception as ex:                                       # noqa: BLE001
         out["downstream"] = f"key_failed: {str(ex)[:160]}"
@@ -315,6 +357,18 @@ def main() -> int:
                          "+ 刷 ledger/latest.json（本批结果）；"
                          "给别的路径则只写那个文件")
     ap.add_argument("--no-write", action="store_true", help="不写台账，只打印")
+    ap.add_argument("--keyless-only", action="store_true",
+                    help="只处理台账里**没有 api_key** 的账号（收割已注册未领 key）")
+    ap.add_argument("--rekey", action="store_true",
+                    help="复用分支遇到「已有 key 但列表接口不给明文」时，"
+                         "**另建一把新 key** 以拿到可用明文（create_key 非幂等）。"
+                         "收割孤儿 key 账号时必须开 —— 否则明文永远取不回来。")
+    ap.add_argument("--registered-only", action="store_true",
+                    help="只处理**已注册成功**（sso_uid 非空）的账号。"
+                         "台账里大量记录是「邮箱拿到但 SSO 注册失败」，"
+                         "它们没有 sso_uid、登录必然失败 —— 收割时必须剔掉，"
+                         "否则 813 条里混着 600+ 条注定失败的，纯空转。"
+                         "配合 --keyless-only = 「已注册未领 key」的精确收割集。")
     args = ap.parse_args()
 
     from src import ledger
@@ -326,6 +380,13 @@ def main() -> int:
         return 1
 
     pool = [d for d in existing if _eligible(d)]
+    if args.registered_only:
+        # 🔴 sso_uid 是**注册成功**的判据（注册失败 → register 阶段报错、sso_uid 留空）。
+        #    收割「已注册未领 key」必须以此为准，不能只看 api_key 是否为空 ——
+        #    空 api_key 的账号里绝大多数是**根本没注册成**的。
+        pool = [d for d in pool if (d.get("sso_uid") or "").strip()]
+    if args.keyless_only:
+        pool = [d for d in pool if not (d.get("api_key") or "").strip()]
     if not pool:
         print(f"✗ {len(existing)} 条记录里没有可用的（需要 email + password）")
         return 1
@@ -345,6 +406,23 @@ def main() -> int:
     lock = threading.Lock()
     results: list[dict] = [None] * n
 
+    def _flush_one(rec: dict) -> None:
+        """单账号**立即**写回台账。
+
+        🔴 容器每 ~10 分钟重启：整批跑完才落盘时，批内已建出的 key 明文
+        （create_key 非幂等，错过就再也拿不回）会被整批带走 —— 实测同一账号
+        被反复 rekey（`default-h1013-113445`→`113726`→…），孤儿 key 堆积。
+        逐账号合并（读最新基线 → merge → save_snapshot），崩溃最多丢当前 1 个。
+        """
+        try:
+            _now = ledger.load_existing(ledger.ledger_path())
+            _base = _now if len(_now) > len(existing) else existing
+            merged, _, _, _ = ledger.merge_records(_base, [rec])
+            ledger.save_snapshot(merged)
+        except Exception as ex:                                   # noqa: BLE001
+            log(f"⚠ 单账号落盘失败（{type(ex).__name__}: {str(ex)[:80]}）"
+                f"—— 批末还有一次兜底写回")
+
     def work(i: int, d: dict) -> None:
         tag = f"[{i + 1}/{n}] {d.get('email', '?')[:34]}"
         def log(msg: str):
@@ -357,10 +435,15 @@ def main() -> int:
             #    无论哪一方胜出，信息都不减少。
             results[i] = {**d, **run_one(d, headless=args.headless,
                                          create=(i < args.create),
+                                         rekey=args.rekey,
                                          key_name=args.key_name, log=log)}
         except Exception as ex:                                   # noqa: BLE001
             results[i] = {**d, "downstream": f"crash: {str(ex)[:160]}"}
             log(f"✗ 崩溃：{str(ex)[:140]}")
+        else:
+            # 🔴 有结果就立即落盘（含崩溃兜底 dict）—— 理由见 `_flush_one`。
+            if results[i]:
+                _flush_one(results[i])
 
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as ex:
@@ -445,7 +528,13 @@ def main() -> int:
         print("\n（--no-write：未写台账）")
         return 0
 
-    merged, kept, added, upgraded = ledger.merge_records(existing, results)
+    # 🔴 并发安全：批次运行期间台账可能被**别的写者**追加过记录（本地注册循环
+    #    与收割工具会同时跑）。用**当下最新**的台账做合并基线，而不是批次开始时
+    #    的 `existing` —— 否则 `merged` 会比当前读源少，`save_snapshot` 的
+    #    `_guard_no_shrink` 直接抛 ValueError，本批结果白跑（重试又可能再撞）。
+    _now = ledger.load_existing(ledger.ledger_path())
+    _base = _now if len(_now) > len(existing) else existing
+    merged, kept, added, upgraded = ledger.merge_records(_base, results)
     # 格式与 `run.py` 共用（src/cli.py）。
     # ⚠ 这里**没有** `if kept:` 守卫，`run.py` 有 —— 那是刻意的差异，
     #   所以共用的是**文本**，不是"打印"这个动作。

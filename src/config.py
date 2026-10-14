@@ -60,11 +60,16 @@ TEMPTF_BASE = os.getenv("IR_TEMPTF_BASE", "https://temp.tf").strip()
 LOGIN_USE_PROXY = os.getenv("IR_LOGIN_USE_PROXY", "0").strip().lower() in (
     "1", "true", "yes", "on")
 # 建箱时按这个顺序降级（实测池子：outlook 25 / hotmail 26 / gmail 5 个账号）
+# 🔴 2026-10-14 实测：**`outlook.com` 域名被目标站限流** —— 用它建箱去注册
+#    `register/byEmail` 恒返回 429 `{"error":"Too many request"}`（我们已用该
+#    域名注册过 400+ 账号）。换成 `hotmail.com` 立刻 200 建号（实测
+#    ssoUid 471900417）。所以默认**不再用 outlook**，从 hotmail 起降级。
+#    要恢复：IR_TEMPTF_PROVIDERS=outlook,hotmail,gmail
 TEMPTF_PROVIDERS = [
     p.strip()
-    for p in os.getenv("IR_TEMPTF_PROVIDERS", "outlook,hotmail,gmail").split(",")
+    for p in os.getenv("IR_TEMPTF_PROVIDERS", "hotmail,gmail").split(",")
     if p.strip()
-] or ["outlook", "hotmail", "gmail"]
+] or ["hotmail", "gmail"]
 
 # 邮箱侧是否走代理（与 tempmail.py 里那个 `IR_PROXY_MAIL` 同义，提到 config 层
 # 是为了让两个后端共用同一条判断，别各写一份）
@@ -73,7 +78,18 @@ MAIL_PROXY = os.getenv("IR_PROXY_MAIL", "").strip().lower() in ("1", "true", "ye
 # ── 阿里云 WAF 挑战（acw_sc__v2）─────────────────────────────────
 # `register/byEmail` 等写接口会返回 JS 挑战页（2026-09-30 实测），由
 # `src/waf_bypass.py` 用真实浏览器算 cookie 后重放。这里是求解超时。
-WAF_SOLVE_TIMEOUT = int(os.getenv("IR_WAF_SOLVE_TIMEOUT", "90"))
+# 2026-10-13：浏览器主路径实测 60~90s（goto 60s + 过 WAF + fetch），90s 会频繁
+# 超时（超时后求解线程仍在跑，只是响应被丢弃）。放宽到 150s。
+WAF_SOLVE_TIMEOUT = int(os.getenv("IR_WAF_SOLVE_TIMEOUT", "150"))
+
+# 🔴 2026-10-13：注册**主路径**用真实浏览器（`browser_post`）而不是 requests。
+#    实测：requests 路径注册一次要发 3+ 次写请求
+#      （裸 POST → WAF 挑战 → 假页面解题 → 重放 → 再遇滑块页 → 转浏览器），
+#    同一出口短时间内多次写 → 触发 `register/byEmail` **按出口 IP 记的** 429。
+#    而真实浏览器一次就能过 WAF（acw 挑战 / `aliyun_waf_aa` 滑块都能解），
+#    只发一次写请求。默认开启；置 0 可退回旧的 requests 路径。
+REGISTER_VIA_BROWSER = os.getenv("IR_REGISTER_VIA_BROWSER", "1").strip().lower() in (
+    "1", "true", "yes", "on")
 
 # ── OpenXLab SSO ─────────────────────────────────────────────────
 SSO_BASE = "https://sso.openxlab.org.cn"
@@ -89,7 +105,13 @@ SSO_GW = f"{SSO_BASE}/gw/uaa-be/api/v1"
 #   某个值"贴进公开仓库会不会让别人获得你的能力 / 把行为关联到你" ——
 #   会 ⇒ 必须 env 化且**默认空**；不会 ⇒ 可以留默认值，但要写清分类理由。
 CLIENT_ID = os.getenv("IR_CLIENT_ID", "dagw07mkg1bazlxzoy31")
-SOURCE = os.getenv("IR_SOURCE", "discovery")
+# 🔴 2026-10-14 实测（tools/probes/probe_reg_variants.py）：
+#    `source="discovery"` 是**活动维度**，站点对它单独限流 —— 带它注册恒
+#    429 `{"error":"Too many request"}`（直连也一样，与 IP/代理/WAF 无关）。
+#    去掉 source（或 clientId）立刻 200 `msgCode:"10000"`、正常建号
+#    （实测 ssoUid 853600446 / 952000228）。所以默认**不再带 source**。
+#    要回到 discovery 活动入口：IR_SOURCE=discovery。
+SOURCE = os.getenv("IR_SOURCE", "")
 
 # RSA 公钥（SPKI/DER base64，服务端静态）
 SSO_PUBKEY_B64 = (
@@ -167,10 +189,28 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
 
+def _find_chrome_path() -> str:
+    """定位 Chrome：环境变量 > Program Files > LOCALAPPDATA（用户级安装）。
+
+    🔴 2026-10-02 实测：本机 Chrome 装在 `%LOCALAPPDATA%\\Google\\Chrome\\...`，
+    而默认写死的 `C:\\Program Files\\...\\chrome.exe` **不存在** —— 有头模式
+    一直在用一个不存在的路径（注册激活都过、登录却起不来）。逐路径探测。
+    """
+    for c in (
+        os.getenv("IR_CHROME_PATH", "").strip(),
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome",
+                     "Application", "chrome.exe"),
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    ):
+        if c and os.path.exists(c):
+            return c
+    return os.getenv("IR_CHROME_PATH", "").strip() or \
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+
+
 # 本机 Chrome（Playwright 驱动，避免下载额外浏览器）
-CHROME_PATH = os.getenv(
-    "IR_CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-)
+CHROME_PATH = _find_chrome_path()
 
 
 # ── 注册配额保护（本地累计计数）───────────────────────────────────
@@ -259,6 +299,15 @@ IR_PROXY_SLOT_TIMEOUT = float(os.getenv("IR_PROXY_SLOT_TIMEOUT", "240") or 240)
 #    "注册全失败"最容易被误读成"换 IP 也不行 / 还在封" —— 结论完全错。
 #    6 个本地端口的 TCP 连通检查是毫秒级的，代价可以忽略。
 IR_PROXY_PREFLIGHT = os.getenv("IR_PROXY_PREFLIGHT", "1").strip().lower() \
+    not in ("0", "false", "no", "off")
+
+# 起飞前**出口可达性**预检（`1` 开 / `0` 关，默认开）。
+# 🔴 端口活 ≠ 出口通：槽位进程监听着本地端口（TCP 连通），但代理链的**下游出口**
+# 可能已被墙 / 被 ACL 拦 / 节点过期 —— 那种状态端口检查永远通过，每条注册却都以
+# "代理连接/超时"收场，和"配置丢了"完全分不清。这里在端口检查之后再**真打一枪**
+# 目标站 `/register` 验证出口能到，打不到的槽位当场剔除。代价是每条槽位多一次
+# HTTPS 握手（秒级），起飞前付一次，换来"假活槽位"不再污染整批注册。
+IR_PROXY_PREFLIGHT_REACH = os.getenv("IR_PROXY_PREFLIGHT_REACH", "1").strip().lower() \
     not in ("0", "false", "no", "off")
 
 
@@ -351,16 +400,24 @@ def slot_scope(url: str) -> str:
     key = slot_key(url)
     ip = SLOT_EGRESS_IPS.get(key)
     if not ip:
-        raise ValueError(
-            f"槽位 {redact.redact_url(url) if url else url} 的出口 IP 未知"
-            f"（键 {key!r} 不在 SLOT_EGRESS_IPS 里）。\n"
-            f"  1) 先量出真实出口 IP： python tools/probes/probe_slots.py\n"
-            f"  2) 写进 .env（**不要写进源码**，出口 IP 不进仓库）：\n"
-            f"       IR_SLOT_EGRESS_IPS={key}=<那个槽位的出口 IP>\n"
-            f"     多个槽位用逗号分隔；键 = URL 里的用户名（带账密时）"
-            f"或端口（裸 host:port 时）\n"
-            f"  3) 迁移台账： python tools/data/migrate_quota_scope.py --apply\n"
-            f"  —— 不能退回按槽位号记账：那会静默把配额记到别的 IP 头上。")
+        # 🔴 回退：按**订阅链接本身**记账，不再抛异常（2026-10-04 改动）。
+        #
+        #    背景：用户给的订阅链接（Resin 这类网关）**出口 IP 会定时自动变**。
+        #    原实现在"键不在 IP 映射表里"时直接抛 ValueError，意味着每换一批
+        #    订阅链接（或 IP 一漂）就必须重新探测并维护 IR_SLOT_EGRESS_IPS，
+        #    否则整个注册直接崩 —— 这不是保护，是把活儿推给人肉运维。
+        #
+        #    为什么退回按链接记账是安全的：配额的本质是"这条订阅链接还能注册
+        #    几个"，而目标站限流看的是它当时那条出口。出口会漂 ⇒ IP 桶本身
+        #    就是个会失效的键；订阅链接（用户名）才是稳定标识。
+        #    用链接当 scope：每条链接一个独立配额桶，换链接即换桶，语义干净。
+        #
+        #    ⚠ 与"同出口 IP 互斥"的关系：那个互斥只在**显式配置了
+        #    IR_SLOT_EGRESS_IPS** 时才启用（见 proxypool 的 slot_ips）。
+        #    出口会漂的场景本就不该启用它 —— 所以这里回退与那边是自洽的。
+        if not key:
+            raise ValueError(f"槽位 URL 解析不出映射键：{redact.redact_url(url)}")
+        return f"slot:{key}"
     return ip
 
 
@@ -402,6 +459,28 @@ def proxies(raw: str = None) -> dict | None:
                 f"代理串格式无法识别：{raw!r}（期望 host:port:user:pass "
                 f"或 scheme://user:pass@host:port）")
     return {"http": raw, "https": raw}
+
+
+def _fill_empty_proxy_pwd(raw: str) -> str:
+    """⚠ **不要接进 `proxies()`** —— 2026-10-14 实测这是个错误的修复。
+
+    曾以为 Resin 槽位的空密码（`http://user:@host:port`）会让 requests 的
+    CONNECT 被回 407，于是补了占位符 `x`（Camoufox 侧确实需要，见
+    `src/browser/launch.py`）。但**requests 侧补了反而全灭**：改前出口预检
+    5/10 可达，改后 **40/40 全部失败**。即网关对 requests 这条链接受的
+    就是空密码，多写一个 `x` 反而认证不过。
+
+    函数保留在此，仅作为"已证伪"的记录与将来的对照，不要调用。
+    """
+    if "://" not in raw or "@" not in raw:
+        return raw
+    scheme, rest = raw.split("://", 1)
+    userinfo, host = rest.rsplit("@", 1)
+    if ":" in userinfo:
+        user, pwd = userinfo.split(":", 1)
+        if user and not pwd:
+            return f"{scheme}://{user}:x@{host}"
+    return raw
 
 
 def apply_proxy(session, proxy: str = None) -> None:
@@ -473,8 +552,11 @@ def validate(*, need_worker_token: bool = True) -> list[str]:
         missing.append(f"IR_PROXY_SLOTS_FILE（指向的文件读不到：{IR_PROXY_SLOTS_FILE}）")
         has_slots = False
     if has_slots and not SLOT_EGRESS_IPS:
-        missing.append(
-            "IR_SLOT_EGRESS_IPS（已配槽位池但缺「端口=出口IP」映射；"
-            "先跑 python tools/probes/probe_slots.py 量出来）")
+        # 🔴 不再是"缺配置"错误（2026-10-04 改动）：订阅链接的**出口 IP 会定时
+        #    自动漂**，`IR_SLOT_EGRESS_IPS` 只在"出口固定、需要按 IP 记配额 /
+        #    做同出口互斥"时才配。不配 → `slot_scope()` 退回按**订阅链接**记账
+        #    （见那里的说明），功能完全正常，不该拦在启动阶段。
+        #    这里只留一条提示，告知当前是哪种记账口径。
+        pass
     return missing
 

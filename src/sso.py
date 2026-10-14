@@ -24,6 +24,7 @@
 
 import json
 import random
+import threading
 import time
 from dataclasses import dataclass
 
@@ -39,6 +40,16 @@ class WafChallengeError(RuntimeError):
     刻意不用 `requests` 的异常类型：它表达的是"这个出口现在过不去"，
     不是"网络故障"。调用方（pipeline）按 network 失败处理 →
     `report_failed`（短冷却）→ 下一个号换出口。
+    """
+
+
+class RateLimitedError(RuntimeError):
+    """`register/byEmail` 的限流（429）—— **按出口 IP** 记，不是业务失败。
+
+    🔴 2026-10-13 实测：同一出口连着两次 429，而换出口立刻拿到业务响应
+    （A0101 / A0216）。所以它必须走 `ERR_NETWORK`（换槽位重试），**不能**
+    落进 `ERR_REJECTED` —— 后者会被 producer 当成"业务拒绝"直接 `break`，
+    既不换出口也不重试，账号就这么废了。
     """
 
 
@@ -71,6 +82,44 @@ class _WrapResponse:
     def raise_for_status(self):
         if self.status_code >= 400:
             raise requests.HTTPError(f"{self.status_code}: {self.text[:120]}")
+
+
+# P0-2: WAF cookie 复用缓存。
+#   同一出口 IP 上，acw_sc__v2 / acw_tc 解出之后**长期有效**；但每个账号都是一个新的
+#   SSOClient（池子 / 跨进程），默认每次都重开浏览器解题 ⇒ 出口越多越慢、还反复打扰。
+#   这里按下层出口（proxy url）缓存解出后的 cookie，后续同出口的客户端直接种上，跳过
+#   浏览器解题。命中后**仍**被挑战 ⇒ 视为失效，失效后重解并刷新缓存（见 _invalidate）。
+_WAF_COOKIE_CACHE: "dict[str, list[dict]]" = {}
+_waf_cache_lock = threading.Lock()
+
+
+def _waf_key(proxy: str | None) -> str:
+    return proxy or "__direct__"
+
+
+def _cache_waf_cookies(key: str, session) -> None:
+    cached = []
+    for c in session.cookies:
+        if c.name in ("acw_sc__v2", "acw_tc") and "openxlab" in (c.domain or ""):
+            cached.append({"name": c.name, "value": c.value, "domain": c.domain})
+    if cached:
+        with _waf_cache_lock:
+            _WAF_COOKIE_CACHE[key] = cached
+
+
+def _seed_waf_cookies(key: str, session) -> bool:
+    with _waf_cache_lock:
+        cached = _WAF_COOKIE_CACHE.get(key)
+    if not cached:
+        return False
+    for c in cached:
+        session.cookies.set(c["name"], c["value"], domain=c["domain"])
+    return True
+
+
+def _invalidate_waf_cookies(key: str) -> None:
+    with _waf_cache_lock:
+        _WAF_COOKIE_CACHE.pop(key, None)
 
 
 class SSOClient:
@@ -108,14 +157,18 @@ class SSOClient:
 
     @staticmethod
     def _is_waf_challenge(r: requests.Response) -> bool:
-        """阿里云 WAF 的 JS 挑战页（2026-09-30 实测开始拦截写接口）。
+        """阿里云 WAF 的拦截页（2026-09-30 起拦写接口）。
 
-        特征：HTTP **200**（不是 403！）+ `text/html` + 页内含
-        `acw_sc__v2` / `aliyunwaf`。与正常 JSON 响应（application/json）一眼可分。
+        🔴 2026-10-13 修订：不能再靠关键字判。WAF 现在还会下发 **`aliyun_waf_aa`
+        变体**（`<!doctype html><meta name="aliyun_waf_aa" content="...">`），
+        页内**没有** `acw_sc__v2` / `aliyunwaf` 关键字 —— 旧判据漏检 → `_post`
+        把它当正常响应返回 → `r.json()` 抛 `Expecting value`（本机实测）。
+
+        新判据：**注册 API 本该只返回 JSON**。任何 HTTP 200 + `text/html`
+        都是 WAF 拦截页，一律交给解题路径处理。
         """
         ct = (r.headers.get("content-type") or "").lower()
-        return ("text/html" in ct
-                and ("acw_sc__v2" in r.text or "aliyunwaf" in r.text))
+        return r.status_code == 200 and "text/html" in ct
 
     # 阿里云 WAF 初级挑战的标准算法（公开逆向结论，2026-09-30 实测有效）：
     # arg1（服务端 40 位 hex）与固定 mask 逐字节异或，再按位置表重排。
@@ -183,7 +236,7 @@ class SSOClient:
             domain="sso.openxlab.org.cn", path="/")
 
     def _post(self, path: str, payload: dict, *, referer: str = "/register",
-              attempts: int = 4,
+              attempts: int = 8,
               abandon_on_challenge: bool = False) -> requests.Response:
         """带退避重试的 POST。
 
@@ -221,9 +274,19 @@ class SSOClient:
         h = self._headers(referer)
         url = f"{self.gw}{path}"
         last = None
+        key = _waf_key(self.proxy)
         # 挑战解法轮换：算出的 cookie 无法本地验证，只能靠重放结果判断 ——
-        # 仍被挑战就换下一种（js 引擎 / 真实浏览器 / 旧算法）
-        solvers = ["js", "browser", "algo"]
+        # 仍被挑战就换下一种（旧算法 / js 引擎 / 真实浏览器）
+        #
+        # 挑战解法轮换：算出的 cookie 无法本地验证，只能靠重放结果判断 ——
+        # 仍被挑战就换下一种。
+        #
+        # 🔴 2026-10-13 实测（服务器）：`js` 引擎解法对当前挑战页**恒返回空串**
+        #    （stub 环境跑不出 cookie），`algo`（旧固定 mask）只在少数挑战上有效，
+        #    而 **`browser`（Camoufox 假页面执行挑战 JS）稳定成功**（实测
+        #    `solve browser OK cookie=True`，且重放能到业务层）。所以让每次重试都
+        #    重跑 browser（挑战页每次下发新 arg1，必须重算），`algo` 仅作最后兜底。
+        solvers = ["browser", "browser", "algo"]
         used = 0
         for i in range(attempts):
             try:
@@ -241,35 +304,89 @@ class SSOClient:
             if self._is_waf_challenge(r):
                 # 🔴 池化产线：放弃解题，换出口（见 abandon_on_challenge 的说明）
                 if abandon_on_challenge:
+                    _invalidate_waf_cookies(key)  # P0-2: 同出口复用命中仍被拦→缓存失效
                     raise WafChallengeError(
                         f"WAF 挑战页，放弃本出口（{r.status_code}）")
                 last = r
+                import sys as _sys
+                # 🔴 2026-10-13：`aliyun_waf_aa` = 阿里云**滑块验证页**。
+                #    requests 侧三种解法（js 引擎 / 假页面 browser / 旧 algo）
+                #    对它**全都无解** —— 假页面跑不出滑块 cookie（实测只得到 []）。
+                #    唯一能过的是**真实浏览器闭环**：`browser_post` 内置
+                #    `solve_aliyun` 拖滑块过验证，再在同一上下文 fetch。
+                #    所以命中滑块页 → 把本次请求整体交给浏览器路径。
+                if "aliyun_waf_aa" in r.text:
+                    try:
+                        from .waf_bypass import WafSolver
+                        res = WafSolver.get().browser_post(
+                            f"{self.gw}{path}", payload, proxy=self.proxy)
+                        wrapped = _WrapResponse(res)
+                        wrapped.json()          # 能解析成 JSON = 已到业务层
+                        _cache_waf_cookies(key, self.session)
+                        print(f"[WAFDBG] aa→browser_post OK status={wrapped.status_code}",
+                              file=_sys.stderr, flush=True)
+                        # 🔴 429 = 注册写接口限流（WAF 已穿过）。这类限流是
+                        #    **按出口 IP** 记的 —— 同一出口连着重试只会被继续拒，
+                        #    换出口才拿得到业务响应。所以这里**不再原地重试**，
+                        #    把 429 交回 `register()` 分类 → pipeline 换槽位。
+                        return wrapped
+                    except Exception as _e:
+                        print(f"[WAFDBG] aa→browser_post FAIL {type(_e).__name__}: {str(_e)[:140]}",
+                              file=_sys.stderr, flush=True)
+                    # 滑块页：假页面解法无解，别再空烧 90s×N
+                    break
                 if used >= len(solvers):
                     break
                 method = solvers[used]
                 used += 1
+                print(f"[WAFDBG] challenge i={i} method={method} len={len(r.text)}", file=_sys.stderr, flush=True)
                 try:
                     self._solve_waf(r, method=method)
-                except Exception:
+                    print(f"[WAFDBG] solve {method} OK cookie={bool(self.session.cookies.get('acw_sc__v2'))}", file=_sys.stderr, flush=True)
+                except Exception as _e:
+                    print(f"[WAFDBG] solve {method} FAIL {type(_e).__name__}: {str(_e)[:120]}", file=_sys.stderr, flush=True)
                     pass       # 解法本身失败 → 换下一种,不中断重试链
+                else:
+                    _cache_waf_cookies(key, self.session)  # P0-2: 解出后缓存供复用
                 continue
             # 🔴 405 = WAF 判这个出口高风险，**不要重试**（重试只会烧同一出口的信誉）
             if r.status_code == 405:
                 last = r
                 break
-            if r.status_code == 429 or r.status_code >= 500:
+            # 🔴 2026-10-13 实测：429 是 `register/byEmail` 的**按出口 IP** 记的
+            #    写限流 —— 同一出口连着重试只会被继续拒（日志里连续两次 429），
+            #    而换出口立刻能拿到业务响应（A0101/A0216）。所以在**同一出口**
+            #    上只给一次机会（区分瞬时限流），然后把 429 交回调用方 →
+            #    `register()` 抛 `RateLimitedError` → pipeline 换槽位重试。
+            #    之前这里会退避 8 次（最坏 ~5 分钟），既没用又在继续烧出口。
+            if r.status_code == 429:
+                if i >= 1:
+                    return r
+                time.sleep(8.0 + random.uniform(0, 3.0))
+                continue
+            if r.status_code >= 500:
                 last = r
                 if i == attempts - 1:
                     break
-                # 优先用服务端给的 Retry-After，没有就指数退避
+                # 优先用服务端给的 Retry-After，没有就指数退避。
                 ra = r.headers.get("Retry-After")
                 try:
                     delay = float(ra) if ra else 1.5 * (2 ** i)
                 except (TypeError, ValueError):
                     delay = 1.5 * (2 ** i)
-                delay = min(delay, 20.0) + random.uniform(0, 1.2)
+                delay = min(delay, 45.0) + random.uniform(0, 2.0)
                 time.sleep(delay)
                 continue
+            _cache_waf_cookies(key, self.session)  # P0-2: 命中后顺手收下 WAF cookie
+            import sys as _sys
+            if "text/html" in (r.headers.get("content-type") or "").lower():
+                try:
+                    import os as _os
+                    _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))), "logs", "waf_block.html")
+                    open(_p, "w", encoding="utf-8").write(r.text)
+                except Exception:
+                    pass
+            print(f"[WAFDBG] pass i={i} status={r.status_code} ct={(r.headers.get('content-type') or '')[:30]} len={len(r.text)}", file=_sys.stderr, flush=True)
             return r
         if isinstance(last, requests.RequestException):
             raise last
@@ -291,6 +408,8 @@ class SSOClient:
         首个 POST **直达业务层**（无挑战）。有头浏览器能过的原因同此 ——
         它天然带了完整的 GET → JS → cookie 链。协议路径补上即等价。
         """
+        key = _waf_key(self.proxy)
+        _seed_waf_cookies(key, self.session)  # P0-2: 同出口复用已解出的 WAF cookie
         try:
             self.session.get(f"{config.SSO_BASE}/register",
                              headers=self._headers("/register"),
@@ -298,6 +417,9 @@ class SSOClient:
         except requests.RequestException:
             # 种会话失败不致命：后面的 _post 遇到挑战页仍有算法兜底
             pass
+        finally:
+            # 收下本次种下的 / 解出的 WAF cookie，供同出口后续客户端跳过解题
+            _cache_waf_cookies(key, self.session)
 
     def register(self, username: str, email: str, password: str) -> RegisterResult:
         payload = {
@@ -307,12 +429,50 @@ class SSOClient:
             "source": config.SOURCE,
             "clientId": config.CLIENT_ID,
         }
-        r = self._post("/register/byEmail", payload,
-                       abandon_on_challenge=self.abandon_on_challenge)
+        r = None
+        # 🔴 2026-10-13：注册默认走**真实浏览器主路径**。
+        #    requests 路径注册一次要发 3+ 次写请求（裸 POST → 挑战 → 解题 →
+        #    重放 → 再遇滑块 → 转浏览器），同出口短时间多次写 ⇒ 触发按 IP
+        #    记的 429。浏览器一次过 WAF，只发一次写请求（见 config 的说明）。
+        if config.REGISTER_VIA_BROWSER:
+            try:
+                from .waf_bypass import WafSolver
+                res = WafSolver.get().browser_post(
+                    f"{self.gw}/register/byEmail", payload, proxy=self.proxy)
+                _r = _WrapResponse(res)
+                _r.json()          # 必须是业务 JSON 才算数（挑战页会在这里炸）
+                r = _r
+                import sys as _sys
+                print(f"[WAFDBG] register via browser OK status={_r.status_code}",
+                      file=_sys.stderr, flush=True)
+            except Exception as _e:
+                import sys as _sys
+                print(f"[WAFDBG] register via browser FAIL {type(_e).__name__}: {str(_e)[:160]}",
+                      file=_sys.stderr, flush=True)
+                r = None            # 浏览器路径没拿下 → 退回 requests 路径
+        if r is None:
+            r = self._post("/register/byEmail", payload,
+                           abandon_on_challenge=self.abandon_on_challenge)
         body = r.json()
+        # 🔴 限流必须先于 `success` 判定：429 的响应体是
+        #    `{"error": "Too many request"}` —— 既没有 `success` 也没有
+        #    `msgCode`，直接查 success 会把它当成普通业务失败（ERR_REJECTED）。
+        if r.status_code == 429 or "too many request" in (
+                f"{body.get('error') or ''} {body.get('msg') or ''}").lower():
+            raise RateLimitedError(
+                f"register/byEmail 限流（{r.status_code} "
+                f"{body.get('error') or body.get('msg') or ''}）")
         data = body.get("data") or {}
+        # 🔴 注册成功的响应体是
+        #    `{"traceId":"...","msgCode":"10000","msg":"ok","data":{"ssoUid":...}}`
+        #    —— **没有 `success` 字段**！只判 `success is True` 会把**注册成功的
+        #    账号当成失败**（浏览器路径实测拿到 msgCode 10000 + ssoUid，却会被
+        #    判成 ERR_REJECTED → `register failed: 10000 ok`，整批 0 成功）。
+        #    所以 `msgCode == "10000"` 也算成功（实测 `msg` 同时是 "ok"）。
+        _ok = (body.get("success") is True
+               or str(body.get("msgCode") or "") == "10000")
         return RegisterResult(
-            ok=body.get("success") is True,
+            ok=_ok,
             sso_uid=str(data.get("ssoUid", "")),
             email=data.get("email", ""),
             username=data.get("username", ""),

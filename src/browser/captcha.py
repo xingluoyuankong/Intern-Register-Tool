@@ -13,9 +13,17 @@ def _click_checkbox(page, cur: tuple) -> tuple:
     """移动到 `#aliyunCaptcha-checkbox-icon` 中心并按下。
 
     返回 (新光标位置, 是否成功发出点击)。
+
+    🔴 `bounding_box()` 必须带短超时（2026-10-03 本机实测）：Path B 降级时
+       复选框可能还没渲染，无参调用默认等 30s 再抛 TimeoutError，直接炸掉
+       整次登录尝试。这里改成 6s 短等、拿不到就返回 False（调用方已有
+       `clicked=False → 继续下一轮` 的处理），把失败变成可重试事件。
     """
     icon = page.locator("#aliyunCaptcha-checkbox-icon").first
-    box = icon.bounding_box()
+    try:
+        box = icon.bounding_box(timeout=6000)
+    except Exception:
+        return cur, False
     if not box or box.get("width", 0) <= 0 or box.get("height", 0) <= 0:
         return cur, False
     cx = box["x"] + box["width"] / 2
