@@ -17,13 +17,24 @@ import os
 import re
 import secrets
 import subprocess
+import threading
 import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-ROOT = "/root/intern-register"
+def _resolve_root() -> str:
+    """项目根目录：优先本文件所在项目（/app/working/intern-register），
+    回退 /root/intern-register（老路径，平台 overlay 会重置，别依赖）。"""
+    here = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))          # .../intern-register
+    if os.path.isdir(os.path.join(here, "ledger")):
+        return here
+    return "/root/intern-register"
+
+
+ROOT = _resolve_root()
 LOG = os.path.join(ROOT, "logs", "loop.log")
 USER = os.getenv("IR_DASH_USER", "admin")
 PASS = os.getenv("IR_DASH_PASS", "irpanel")
@@ -192,7 +203,51 @@ def summarize():
         "records": sorted(
             ok_all + fail_all,
             key=lambda r: (key_time(r) if r.get("api_key")
-                           else fail_time(r)) or "", reverse=True)[:120],
+                           else fail_time(r)) or "", reverse=True)[:60],
+    }
+
+
+# ── 聚合缓存（后台线程刷新）──────────────────────────────────────
+# 🔴 2026-10-14 实测：`summarize()` 每次请求都要 glob + 解析 `ledger/runs/**/*.json`
+#    全部快照。快照最多时上千份、每份 ~2MB → 单次响应可达**数十秒**
+#    → 浏览器/Cloudflare 超时 → 前端整页显示 "–"（就是"面板全 –"的真因，
+#    不是接口挂、也不是 JS 语法）。改为**后台线程定时重算**，API 只读缓存，
+#    响应恒定毫秒级。
+_SUM_CACHE = {"t": 0.0, "v": None, "err": ""}
+_SUM_LOCK = threading.Lock()
+SUM_REFRESH = 15.0
+
+
+def _refresh_loop():
+    while True:
+        try:
+            v = summarize()
+            with _SUM_LOCK:
+                _SUM_CACHE["v"] = v
+                _SUM_CACHE["t"] = time.time()
+                _SUM_CACHE["err"] = ""
+        except Exception as ex:                       # noqa: BLE001
+            with _SUM_LOCK:
+                _SUM_CACHE["err"] = f"{type(ex).__name__}: {ex}"[:200]
+        time.sleep(SUM_REFRESH)
+
+
+def summarize_cached():
+    """立即返回缓存（不阻塞）；首轮还没算完时给个 warming 占位。"""
+    with _SUM_LOCK:
+        if _SUM_CACHE["v"] is not None:
+            return _SUM_CACHE["v"]
+        err = _SUM_CACHE["err"]
+    now8 = datetime.now(TZ8)
+    return {
+        "now": now8.strftime("%Y-%m-%d %H:%M:%S"),
+        "today": now8.strftime("%Y-%m-%d"),
+        "total_accounts": 0, "total_keys": 0, "today_keys": 0,
+        "today_fail": 0, "fail_top": [], "hourly": [], "records": [],
+        "loop": {"status": "warming" if not err else "err",
+                 "rounds": 0, "keys_session": 0, "last_round": "",
+                 "tail": (["[面板] 正在首次聚合台账，请稍候（约十几秒）…"]
+                          if not err else [f"[面板] 聚合失败：{err}"])},
     }
 
 
@@ -328,12 +383,16 @@ const $=s=>document.querySelector(s);
 function esc(s){return (s??'').toString().replace(/[&<>"]/g,
  c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function fmt_ms(m){return m>=1000?(m/1000).toFixed(1)+'s':m+'ms'}
-function copy(t,navigator.clipboard.writeText(t)){}
-function load(){
- fetch('/api/summary').then(r=>{
+function copy(t){navigator.clipboard.writeText(t)}
+let failStreak=0;
+function load(tries){
+ tries=tries||0;
+ fetch('/api/summary',{cache:'no-store'}).then(r=>{
   if(r.status===401){location.href='/login';throw new Error('登录已过期')}
+  if(!r.ok){throw new Error('HTTP '+r.status)}
   return r.json()
  }).then(d=>{
+  failStreak=0;
   $('#k_today').textContent=d.today_keys;
   $('#k_fail').textContent=d.today_fail;
   $('#k_total').textContent=d.total_keys;
@@ -363,7 +422,13 @@ function load(){
    <td><span class="tag ${ok?'ok':'bad'}">${ok?'success':esc(r.error_kind||r.status)}</span></td>
    <td>${r.timings&&r.timings.login_detail?'–':fmt_ms(r.timings?.register||0)}</td></tr>`}).join('');
   $('#log').textContent=(d.loop.tail||[]).join('\\n')||'(空)';
- }).catch(e=>{$('#now').textContent='加载失败: '+e});
+ }).catch(e=>{
+  const m=String((e&&e.message)||e);
+  if(m.indexOf('登录已过期')>=0) return;
+  failStreak++;
+  if(tries<2){setTimeout(()=>load(tries+1),1500);return}
+  $('#now').innerHTML='<span style="color:var(--bad)">取数失败×'+failStreak+'：'+m+'</span>';
+ });
 }
 copy=t=>{navigator.clipboard.writeText(t).then(()=>{},()=>{})};
 load();let left=10;setInterval(()=>{left--;$('#cd').textContent=Math.max(left,0);
@@ -426,7 +491,7 @@ class H(BaseHTTPRequestHandler):
         if not self._auth():
             return
         if p == "/api/summary":
-            self._send(200, json.dumps(summarize(), ensure_ascii=False),
+            self._send(200, json.dumps(summarize_cached(), ensure_ascii=False),
                        "application/json; charset=utf-8")
         elif p in ("/", "/index.html"):
             self._send(200, PAGE)
@@ -460,5 +525,6 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     _load_sessions()
+    threading.Thread(target=_refresh_loop, daemon=True).start()
     print(f"dashboard on :{PORT}  user={USER}", flush=True)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
