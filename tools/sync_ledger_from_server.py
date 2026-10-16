@@ -8,11 +8,14 @@
 import json
 import os
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL = os.path.join(ROOT, "ledger", "latest.json")
-SERVER = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\XZXyuan\AppData\Local\Temp\srv_latest.json"
+# 🔴 2026-10-16：默认路径不再写死本机用户名（泄漏闸门会拦）。
+SERVER = (sys.argv[1] if len(sys.argv) > 1
+          else os.path.join(tempfile.gettempdir(), "srv_export_all.json"))
 
 local = json.load(open(LOCAL, encoding="utf-8"))
 server = json.load(open(SERVER, encoding="utf-8"))

@@ -77,7 +77,7 @@ def _launch_kwargs(headless: bool, chrome_args=None) -> dict:
         # 🔴 2026-10-02 实测（本机 Clash 系统代理=7897）：
         #    **不加 launch proxy 时，Chrome 仍会走 Windows 系统代理** ——
         #    本机系统代理指向 Clash(7897)，Clash 把 `sso.openxlab.org.cn`
-        #    路由到**国外节点**（出口实测 54.168.101.58 日本 / 18.138.188.208 新加坡），
+        #    路由到**国外节点**（出口实测 54.168.101.x 日本 / 18.138.188.x 新加坡），
         #    国外节点到国内 sso 的 TLS 握手直接失败 → `ERR_CONNECTION_CLOSED`
         #    / 页面永远加载不出（用户看到的"浏览器卡死/自动挂掉"）。
         #    而 curl `--noproxy` 直连 sso = 200 OK 0.40s，证明**真实国内直连是通的**。

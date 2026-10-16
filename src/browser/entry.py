@@ -23,7 +23,7 @@ def login(account: str, password: str, *, headless: bool = True,
 
     Args:
         proxy: 🔴 **代理串**（`http://user:pass@host:port`）。不给就直连 ——
-            实测直连会踩服务器公网 IP（47.84.122.196）的 WAF 405/限流，
+            实测直连会踩服务器公网 IP（47.84.122.x）的 WAF 405/限流，
             表现为「register: ok, activate: ok，但 login: net::ERR_CONNECTION」
             即注册激活都成了却拿不到 key（2026-09-30 批量零产出的真因）。
             必须把注册用的同一个 Resin 槽位传进来，全流程同出口。
