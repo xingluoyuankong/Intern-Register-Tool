@@ -1,0 +1,19 @@
+---
+tunnel: e4e853da-74d9-41e5-be51-0be5bebefb4b
+credentials-file: /root/.cloudflared/e4e853da-74d9-41e5-be51-0be5bebefb4b.json
+
+# 🔴 2026-10-16：`ir-qwenpaw-tom`（看板）这条 ingress 曾随 /root 被容器重建重置，
+#    掉进末尾的 `http_status:404` → 公网面板 404（本地 8000 其实是通的）。
+#    本文件是 **NAS 上的权威副本**，恢复见 deploy/supervisor/restore.sh。
+ingress:
+  - hostname: web-qwenpaw-tom.xzxyuan.ccwu.cc
+    service: http://localhost:8088
+  - hostname: shell-qwenpaw-tom.xzxyuan.ccwu.cc
+    service: ssh://localhost:22
+  - hostname: qwenpaw-tom.xzxyuan.ccwu.cc
+    service: ssh://localhost:22
+  - hostname: ir-qwenpaw-tom.xzxyuan.ccwu.cc
+    service: http://localhost:8000
+  - hostname: grok2api-tom.xzxyuan.ccwu.cc
+    service: http://localhost:8000
+  - service: http_status:404

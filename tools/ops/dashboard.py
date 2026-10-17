@@ -173,11 +173,21 @@ def summarize():
     # 循环状态
     loop = {"status": "unknown", "rounds": 0, "keys_session": 0,
             "last_round": "", "tail": []}
+    # 🔴 2026-10-17：业务进程由**独立 supervisord 实例**托管
+    #    （/etc/supervisord-ir.conf，见 deploy/supervisor/），默认 socket
+    #    /var/run/supervisor.sock 在容器重建后不存在 → 面板状态会显示成
+    #    "unix:///var/run/supervis..." 这种报错串。按候选顺序取第一个可用的。
+    _sup_cmd = ["supervisorctl"]
+    for _c in ("/etc/supervisord-ir.conf",
+               "/etc/supervisor/conf.d/supervisord.conf"):
+        if os.path.exists(_c):
+            _sup_cmd += ["-c", _c]
+            break
     try:
-        out = subprocess.run(["supervisorctl", "status", "regloop"],
+        out = subprocess.run(_sup_cmd + ["status", "regloop"],
                              capture_output=True, text=True, timeout=8).stdout
         m = re.search(r"(RUNNING|FATAL|EXITED|STOPPED|BACKOFF)", out)
-        loop["status"] = m.group(1) if m else out.strip()[:24]
+        loop["status"] = m.group(1) if m else (out.strip()[:24] or "unknown")
     except Exception as ex:
         loop["status"] = f"err:{type(ex).__name__}"
     try:
