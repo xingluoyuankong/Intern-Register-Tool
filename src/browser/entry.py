@@ -1,0 +1,64 @@
+"""单账号登录入口 —— 每次尝试新建浏览器（`with sync_playwright()`）。
+
+⚠ 与 `session.BrowserSession` 的区别：本入口**不复用浏览器会话**。
+  批量场景要用 `BrowserSession` 复用同一个浏览器，省掉每次冷启动。
+"""
+
+from .attempt import _run_attempt
+from .launch import current_engine, launch_browser
+from .session import _retry_loop
+from .state import LoginResult
+
+
+# ────────────────────────────────────────────────────────────────
+# 单账号入口（自带浏览器生命周期）
+# ────────────────────────────────────────────────────────────────
+def login(account: str, password: str, *, headless: bool = True,
+          timeout: int = 150, attempts: int = 3, cooldown: float = 15.0,
+          screenshot_prefix: str = None, verbose: bool = False,
+          chrome_args=None, proxy: str = None) -> LoginResult:
+    """用真实浏览器登录 SSO，返回 JWT。
+
+    单账号场景用这个；批量场景请用 `BrowserSession` 复用浏览器进程。
+
+    Args:
+        proxy: 🔴 **代理串**（`http://user:pass@host:port`）。不给就直连 ——
+            实测直连会踩服务器公网 IP（47.84.122.196）的 WAF 405/限流，
+            表现为「register: ok, activate: ok，但 login: net::ERR_CONNECTION」
+            即注册激活都成了却拿不到 key（2026-09-30 批量零产出的真因）。
+            必须把注册用的同一个 Resin 槽位传进来，全流程同出口。
+        account: 邮箱 / 手机号 / 用户名
+        password: 明文密码
+        headless: 无头模式。**默认 True**（实测可用，3/3 通过，见文件头说明）。
+            ⚠ 2026-09-20 起默认无头：要弹窗口排查请显式传 `headless=False`。
+        timeout: 单次尝试里验证码阶段的等待上限（秒）
+        attempts: 失败后换新会话重试的次数
+        cooldown: 两次尝试之间的冷却基数（秒），按次数线性递增
+        screenshot_prefix: 若提供，保存过程截图便于排查
+        verbose: 打印验证码交互细节
+        chrome_args: 自定义 Chrome 启动参数；`None` → 模块级 `CHROME_ARGS`。
+            **要注入启动参数请用这个**，不要去改 `CHROME_ARGS` 全局
+            （理由见 `_launch_kwargs()`）。
+
+    Returns:
+        LoginResult；`attempts_used` 记录实际用掉几次尝试，`timings` 是各阶段耗时(ms)。
+    """
+    def run_once(tag):
+        # 🔴 Camoufox：每次尝试**新建浏览器** —— 全新指纹 + 独立出口
+        #    （Firefox 代理是启动级，换出口必须换实例）。
+        #    `with` 退出会自动 close；不 close 会让同一线程后续 Camoufox
+        #    全部报 "Sync API inside the asyncio loop"。
+        with launch_browser(proxy, headless=headless) as browser:
+            return _run_attempt(browser, account=account, password=password,
+                                headless=headless, timeout=timeout,
+                                screenshot_prefix=screenshot_prefix,
+                                verbose=verbose, tag=tag,
+                                # 代理已在启动级注入；context 级不再设，避免覆盖
+                                proxy=None,
+                                # 指纹浏览器：locale/时区交给 Camoufox 的 geoip
+                                # （no_viewport 是 Firefox 专属，Chrome 下必须 False）
+                                fingerprint_browser=(current_engine()
+                                                     == "camoufox"))
+
+    return _retry_loop(run_once, attempts=attempts, cooldown=cooldown,
+                       verbose=verbose, retry_hint="换新会话重试")
